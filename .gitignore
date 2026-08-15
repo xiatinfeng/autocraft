@@ -8,6 +8,10 @@ run/
 # 参考源码（第三方，不入库）
 emi-source/
 jei-source/
+ae2-source/
+rs-source/
+sophbackpacks-source/
+sophcore-source/
 _emijar/
 _emijar24/
 _rsref/
