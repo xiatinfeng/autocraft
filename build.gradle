@@ -1,0 +1,76 @@
+buildscript {
+    repositories {
+        mavenCentral()
+        maven { url = 'https://maven.minecraftforge.net' }
+    }
+    dependencies {
+        classpath group: 'net.minecraftforge.gradle', name: 'ForgeGradle', version: '6.0.+'
+    }
+}
+
+apply plugin: 'net.minecraftforge.gradle'
+apply plugin: 'eclipse'
+
+version = '1.1.0'
+group = 'com.adimn.autocraft'
+archivesBaseName = 'autocraft'
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+minecraft {
+    // EMI 1.20.1 Forge 的内部类引用 mojmap（官方）名，故本工程必须用 official 映射，否则类型对不上编不过。
+    mappings channel: 'official', version: '1.20.1'
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'forge.logging.console.level', 'debug'
+            mods {
+                autocraft {
+                    source sourceSets.main
+                }
+            }
+        }
+        server {
+            workingDirectory project.file('run')
+            mods {
+                autocraft {
+                    source sourceSets.main
+                }
+            }
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+    flatDir { dirs 'libs' }
+}
+
+dependencies {
+    minecraft 'net.minecraftforge:forge:1.20.1-47.4.0'
+    // EMI 1.20.1 Forge（已锁定版本）。EMI 内部包无稳定契约，升级 EMI 需同步回归 + 重钉此版本。
+    // 如需改为 Maven 坐标： implementation fg.deobf("curse.maven:emi-580555:6420945")
+    // EMI 1.1.24 Forge 的 jar 内部类已是官方(mojmap)名（javap 核实：net/minecraft/client/gui/screens 复数包即 mojmap），
+    // 与本项目 mappings channel:'official' 一致，故直接 files() 引入即可，无需 fg.deobf（fg.deobf 对 files() 会失败并报
+    // "Cannot deobfuscate"，反而破坏 forge 编译 classpath）。升级 EMI 需同步回归 + 重钉此版本。
+    implementation files('libs/emi-1.1.24+1.20.1+forge.jar')
+    // JEI 1.20.1 Forge（已锁定用户环境版本 15.20.0.129，mojmap 名，与本项目 official 映射一致）。
+    // 仅引用 RecipesGui 公开方法（getArea / getIngredientUnderMouse），运行期由环境 JEI 提供；
+    // JeiGuard + JeiButtonAdder 双层隔离保证 JEI 未安装时零加载。
+    implementation files('libs/jei-1.20.1-forge-15.20.0.129.jar')
+}
+
+jar {
+    manifest {
+        attributes([
+                "Specification-Title"    : "EMI AutoCraft",
+                "Specification-Version"  : "1",
+                "Implementation-Version" : project.version,
+        ])
+    }
+}
+jar.finalizedBy('reobfJar')

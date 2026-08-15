@@ -1,0 +1,31 @@
+# Gradle / build
+build/
+.gradle/
+*.log
+deps.log
+run/
+
+# 参考源码（第三方，不入库）
+emi-source/
+jei-source/
+_emijar/
+_emijar24/
+_rsref/
+
+# 本地脚本/临时文件
+_classparse.py
+_strings.py
+_emistrings.txt
+
+# 散落的旧 jar（构建依赖在 libs/）
+*.jar
+!libs/*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+bin/

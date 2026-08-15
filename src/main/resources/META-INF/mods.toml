@@ -1,0 +1,20 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+[[mods]]
+modId="autocraft"
+version="1.1.0"
+displayName="AutoCraft"
+description="一键自动合成整条配方树（嵌套合成）。纯客户端，仅需 JEI/EMI（可选）。"
+[[dependencies.autocraft]]
+modId="forge"
+mandatory=true
+versionRange="[47,)"
+ordering="NONE"
+side="CLIENT"
+[[dependencies.autocraft]]
+modId="emi"
+mandatory=false
+versionRange="*"
+ordering="NONE"
+side="CLIENT"
