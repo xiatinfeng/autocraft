@@ -36,4 +36,4 @@
 
 ## 许可
 
-MIT © xiatinfeng
+BSD 2-Clause © xiatinfeng
