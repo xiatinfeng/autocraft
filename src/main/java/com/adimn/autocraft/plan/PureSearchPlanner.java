@@ -193,28 +193,35 @@ public final class PureSearchPlanner {
 
         /** 求解"需要 ingredient.count() 个某物品"：三条路顺序尝试、失败回溯。 */
         private boolean solveDemand(IngredientRef ingredient, List<Task> rest, int pendingCount) {
-            // 路①：单个替代物库存直接够
-            for (MaterialRef alternative : ingredient.alternatives()) {
-                int have = stock.getOrDefault(alternative, 0);
-                if (have < ingredient.count()) {
-                    continue;
+            // 可复用催化剂：不消耗库存，只需持有 count 个；不够时走生产路③。
+            if (ingredient.reusable()) {
+                if (reusableAvailable(ingredient)) {
+                    return solve(rest);
                 }
-                setStock(alternative, have - ingredient.count());
-                if (solve(rest)) {
-                    return true;
+            } else {
+                // 路①：单个替代物库存直接够
+                for (MaterialRef alternative : ingredient.alternatives()) {
+                    int have = stock.getOrDefault(alternative, 0);
+                    if (have < ingredient.count()) {
+                        continue;
+                    }
+                    setStock(alternative, have - ingredient.count());
+                    if (solve(rest)) {
+                        return true;
+                    }
+                    setStock(alternative, have);   // 回填
+                    backtracks++;
                 }
-                setStock(alternative, have);   // 回填
-                backtracks++;
-            }
 
-            // 路②：tag 变体聚合（多个替代物凑够 N）
-            Map<MaterialRef, Integer> consumed = consumeAcrossAlternatives(ingredient, rest);
-            if (consumed != null) {
-                if (solve(rest)) {
-                    return true;
+                // 路②：tag 变体聚合（多个替代物凑够 N）
+                Map<MaterialRef, Integer> consumed = consumeAcrossAlternatives(ingredient, rest);
+                if (consumed != null) {
+                    if (solve(rest)) {
+                        return true;
+                    }
+                    consumed.forEach(this::setStock);  // 回填
+                    backtracks++;
                 }
-                consumed.forEach(this::setStock);  // 回填
-                backtracks++;
             }
 
             // 路③：生产 X
@@ -227,7 +234,19 @@ public final class PureSearchPlanner {
                 if (needed <= 0) {
                     continue;
                 }
+                // 配方枚举顺序：非互转环（真实直合）优先，互转环（如 锭⇄块）后置，
+                // 避免“先合成 9 个再拆回 1 个”的无意义分支被当成首选成功路径。
+                List<RecipeNode> orderedCandidates = new ArrayList<>();
+                List<RecipeNode> roundTripCandidates = new ArrayList<>();
                 for (RecipeNode candidate : graph.recipesFor(wanted)) {
+                    if (isRoundTripRecipe(candidate, wanted)) {
+                        roundTripCandidates.add(candidate);
+                    } else {
+                        orderedCandidates.add(candidate);
+                    }
+                }
+                orderedCandidates.addAll(roundTripCandidates);
+                for (RecipeNode candidate : orderedCandidates) {
                     if (steps.size() + scheduledRecipes(rest) >= maxSteps) {
                         stepLimitReached = true;   // 步骤护栏：跳过该分支
                         continue;
@@ -242,7 +261,8 @@ public final class PureSearchPlanner {
                     if (batches <= 0) {
                         continue;
                     }
-                    int consumeCount = ingredient.count();
+                    // 催化剂生产出来后不消耗，仍留在库存供后续复用。
+                    int consumeCount = ingredient.reusable() ? 0 : ingredient.count();
                     int scheduledBatches = batches;
                     List<Task> continuation = rest;
                     if (selfConsumed > 0) {
@@ -271,7 +291,17 @@ public final class PureSearchPlanner {
                                 break;
                             }
                             IngredientRef scaled = new IngredientRef(
-                                    input.alternatives(), (int) scaledCount);
+                                    input.alternatives(), (int) scaledCount, input.requirementText(), false);
+                            if (!tryConsumeDirect(scaled, rest, consumedInputs)) {
+                                inputsOk = false;
+                                break;
+                            }
+                        }
+                        // 催化剂只需持有 count 个，不消耗。
+                        for (IngredientRef catalyst : candidate.catalysts()) {
+                            IngredientRef scaled = new IngredientRef(
+                                    catalyst.alternatives(), catalyst.count(),
+                                    catalyst.requirementText(), true);
                             if (!tryConsumeDirect(scaled, rest, consumedInputs)) {
                                 inputsOk = false;
                                 break;
@@ -283,7 +313,9 @@ public final class PureSearchPlanner {
                         }
                         List<Task> directBranch = new ArrayList<>(rest.size() + 1);
                         directBranch.add(new CompleteRecipeTask(candidate,
-                                candidate.outputCount(), ingredient.count(), scheduledBatches));
+                                candidate.outputCount(),
+                                ingredient.reusable() ? 0 : ingredient.count(),
+                                scheduledBatches));
                         directBranch.addAll(rest);
                         resolving.add(wanted);
                         if (solve(directBranch)) {
@@ -373,8 +405,24 @@ public final class PureSearchPlanner {
          * 直合模式：只从库存满足一个槽位需求（单替代物直接够，或多个替代物聚合）。
          * 成功时把变更记录追加到 rollbacks（供整体回滚），返回 true。
          */
+        /** 可复用催化剂槽位是否已有足够持有量（跨替代物合计，不消耗）。 */
+        private boolean reusableAvailable(IngredientRef ingredient) {
+            long total = 0L;
+            for (MaterialRef alt : ingredient.alternatives()) {
+                total += stock.getOrDefault(alt, 0);
+                if (total >= ingredient.count()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         private boolean tryConsumeDirect(IngredientRef ingredient, List<Task> rest,
                                          List<Map<MaterialRef, Integer>> rollbacks) {
+            // 可复用催化剂：只校验持有，不从库存扣除。
+            if (ingredient.reusable()) {
+                return reusableAvailable(ingredient);
+            }
             // 单替代物直接够
             for (MaterialRef alternative : ingredient.alternatives()) {
                 int have = stock.getOrDefault(alternative, 0);
@@ -437,16 +485,22 @@ public final class PureSearchPlanner {
             return false;
         }
 
-        /** 展开配方分支：每个输入 → 数量×batches 的 DemandTask，末尾接 CompleteRecipeTask + rest。 */
+        /** 展开配方分支：普通输入 → 数量×batches 的 DemandTask；催化剂 → 持有 count 个的 DemandTask。 */
         private List<Task> recipeBranch(RecipeNode candidate, int batches, int consumeCount,
                                         List<Task> rest) {
-            List<Task> branch = new ArrayList<>(candidate.inputs().size() + 1 + rest.size());
+            List<Task> branch = new ArrayList<>(
+                    candidate.inputs().size() + candidate.catalysts().size() + 1 + rest.size());
             for (IngredientRef input : candidate.inputs()) {
                 long scaled = (long) input.count() * batches;
                 if (scaled > Integer.MAX_VALUE) {
                     return null;
                 }
-                branch.add(new DemandTask(new IngredientRef(input.alternatives(), (int) scaled)));
+                branch.add(new DemandTask(new IngredientRef(input.alternatives(), (int) scaled,
+                        input.requirementText(), false)));
+            }
+            for (IngredientRef catalyst : candidate.catalysts()) {
+                branch.add(new DemandTask(new IngredientRef(catalyst.alternatives(), catalyst.count(),
+                        catalyst.requirementText(), true)));
             }
             branch.add(new CompleteRecipeTask(candidate, candidate.outputCount(),
                     consumeCount, batches));
@@ -461,6 +515,26 @@ public final class PureSearchPlanner {
             }
             long batches = ((long) needed + outputCount - 1L) / outputCount;
             return batches > Integer.MAX_VALUE ? -1 : (int) Math.max(1L, batches);
+        }
+
+        /**
+         * 互转环检测：配方的某个输入 alt 存在“把 wanted 作为输入”的配方（如 锭⇄块）。
+         * 这类配方作为首选会产出无意义的方块往返，应排到真实直合配方之后。
+         */
+        private boolean isRoundTripRecipe(RecipeNode candidate, MaterialRef wanted) {
+            for (IngredientRef input : candidate.inputs()) {
+                for (MaterialRef alt : input.alternatives()) {
+                    if (alt.equals(wanted)) {
+                        continue;
+                    }
+                    for (RecipeNode altRecipe : graph.recipesFor(alt)) {
+                        if (selfConsumedPerBatch(altRecipe, wanted) > 0) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
         }
 
         /** 该配方每批消耗"自身输出物"的数量（染色类自耗配方）。 */

@@ -5,7 +5,7 @@ import net.minecraft.client.Minecraft;
 
 /**
  * 配方屏返回工具：EMI 的 RecipeScreen.old 记录打开它之前的容器界面。
- * （与 RecipeScreenButtonHandler 共用，避免重复代码。）
+ * （EMI 齿轮按钮 AutoCraftRecipeWidget 点击后返回用。）
  */
 public final class RecipeScreenHolder {
     private RecipeScreenHolder() {}

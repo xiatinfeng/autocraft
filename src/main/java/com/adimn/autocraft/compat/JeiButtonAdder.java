@@ -5,6 +5,8 @@ import com.adimn.autocraft.trigger.OrderTrigger;
 import com.adimn.autocraft.util.Log;
 
 import mezz.jei.api.constants.VanillaTypes;
+import mezz.jei.api.gui.IRecipeLayoutDrawable;
+import mezz.jei.api.recipe.category.IRecipeCategory;
 import mezz.jei.common.util.ImmutableRect2i;
 import mezz.jei.gui.recipes.RecipesGui;
 
@@ -38,19 +40,22 @@ public final class JeiButtonAdder {
     /** 由 ScreenEvent.Init.Post 调用（调用方已用类名字符串确认是 RecipesGui）。 */
     public static void addButton(Screen screen, ScreenEvent.Init.Post event) {
         if (!(screen instanceof RecipesGui jeiScreen)) {
+            Log.warn("JEI addButton 收到非 RecipesGui：" + screen.getClass().getName());
             return;
         }
         ImmutableRect2i area = jeiScreen.getArea();
-        int x = area.getX() + area.getWidth() + 2;
+        int x = area.getX() + area.getWidth() - 14;
         int y = area.getY() + 4;
-        Log.debug("JEI 齿轮按钮位置：area=" + area + " button=[" + x + "," + y + "]");
+        Log.info("JEI 齿轮按钮位置：area=" + area + " button=[" + x + "," + y + "]");
 
-        GearButton button = new GearButton(x, y, b -> onGearClick(jeiScreen));
+        GearButton button = new GearButton(x, y, b -> triggerFor(jeiScreen));
         button.setTooltip(Tooltip.create(Component.literal("自动合成悬停物品")));
         event.addListener(button);  // Screen.addRenderableWidget 是 protected，走 Forge 事件公开入口
+        Log.info("JEI 齿轮按钮已 addListener，位置 x=" + x + " y=" + y);
     }
 
-    private static void onGearClick(RecipesGui jeiScreen) {
+    /** 供 JEI Mixin 点击按钮时调用。 */
+    public static void triggerFor(RecipesGui jeiScreen) {
         Optional<ItemStack> hovered = jeiScreen.getIngredientUnderMouse(VanillaTypes.ITEM_STACK);
         if (hovered.isEmpty() || hovered.get().isEmpty()) {
             CraftExecutor.chat("请先在 JEI 配方屏悬停目标物品，再点齿轮按钮。");
@@ -64,5 +69,40 @@ public final class JeiButtonAdder {
         }
         Log.info("JEI 齿轮按钮点击，目标=" + key + " x" + stack.getCount());
         OrderTrigger.order(com.adimn.autocraft.plan.MaterialRef.of(key.toString()), 1);
+    }
+
+    /** 供 JEI Mixin 按“当前配方布局”点击齿轮按钮时调用。 */
+    public static void triggerForRecipe(Object recipeLayoutObj) {
+        try {
+            IRecipeLayoutDrawable<?> recipeLayout = (IRecipeLayoutDrawable<?>) recipeLayoutObj;
+            Object recipe = recipeLayout.getRecipe();
+            @SuppressWarnings("rawtypes")
+            IRecipeCategory category = recipeLayout.getRecipeCategory();
+            ResourceLocation recipeId = category.getRegistryName(recipe);
+            if (recipeId == null) {
+                CraftExecutor.chat("无法识别该配方 ID，无法自动合成。");
+                return;
+            }
+            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+            if (mc.level == null) {
+                return;
+            }
+            mc.level.getRecipeManager().byKey(recipeId).ifPresent(r -> {
+                ItemStack out = r.getResultItem(mc.level.registryAccess());
+                if (out.isEmpty()) {
+                    CraftExecutor.chat("该配方没有可识别的产出，无法自动合成。");
+                    return;
+                }
+                ResourceLocation key = net.minecraftforge.registries.ForgeRegistries.ITEMS.getKey(out.getItem());
+                if (key == null) {
+                    CraftExecutor.chat("无法识别产出物品，无法自动合成。");
+                    return;
+                }
+                Log.info("JEI 配方按钮点击，配方=" + recipeId + " 目标=" + key);
+                OrderTrigger.order(com.adimn.autocraft.plan.MaterialRef.of(key.toString()), 1);
+            });
+        } catch (Throwable t) {
+            Log.warn("JEI 配方按钮点击失败：" + t);
+        }
     }
 }

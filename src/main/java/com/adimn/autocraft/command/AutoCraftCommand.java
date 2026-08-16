@@ -34,8 +34,8 @@ import net.minecraftforge.registries.ForgeRegistries;
 
 /**
  * 调试命令（M2/M3）：
- *   /autocraft plan  <item>  规划并打印步骤清单（不执行）
- *   /autocraft craft <item>  规划并立即执行（需打开合成台 3x3）
+ *   /autocraft plan  <item>  规划并打印步骤清单（不执行、不弹预览）
+ *   /autocraft craft <item>  规划 + 预览 + 执行（需打开合成台 3x3）
  *   /autocraft stop          停止当前执行
  * 依赖：单机（集成服务器）下命令源有完整配方表 + 玩家背包快照。
  */
@@ -54,22 +54,33 @@ public final class AutoCraftCommand {
                 .then(Commands.literal("delay")
                         .then(Commands.argument("ticks", IntegerArgumentType.integer(0, 1200))
                                 .executes(AutoCraftCommand::delay)))
+                .then(Commands.literal("speed")
+                        .then(Commands.argument("ticks", IntegerArgumentType.integer(0, 200))
+                                .executes(AutoCraftCommand::speed)))
                 .then(Commands.literal("preview")
                         .then(Commands.argument("on", BoolArgumentType.bool())
                                 .executes(AutoCraftCommand::preview)))
                 .then(Commands.literal("cross")
                         .then(Commands.argument("on", BoolArgumentType.bool())
                                 .executes(AutoCraftCommand::crossLayer)))
+                .then(Commands.literal("quantity")
+                        .then(Commands.literal("extra")
+                                .executes(ctx -> quantity(ctx, true)))
+                        .then(Commands.literal("total")
+                                .executes(ctx -> quantity(ctx, false))))
+                .then(Commands.literal("fixnodes")
+                        .then(Commands.argument("on", BoolArgumentType.bool())
+                                .executes(AutoCraftCommand::fixedNodes)))
                 .then(Commands.literal("stop")
                         .executes(AutoCraftCommand::stop)));
     }
 
-    /** /autocraft plan <item>：规划并打印清单，可行则打开预览界面（可确认执行）。 */
+    /** /autocraft plan <item>：规划并打印清单（不执行，不弹预览）。 */
     private static int plan(CommandContext<CommandSourceStack> ctx) {
-        return runPlan(ctx, true);
+        return runPlan(ctx, false);
     }
 
-    /** /autocraft craft <item>：规划 + 预览 + 执行（与 plan 同路径）。 */
+    /** /autocraft craft <item>：规划 + 预览 + 执行（复用本次规划结果，不二次规划）。 */
     private static int craft(CommandContext<CommandSourceStack> ctx) {
         return runPlan(ctx, true);
     }
@@ -80,6 +91,16 @@ public final class AutoCraftCommand {
         Config.setDelayOverride(ticks);
         ctx.getSource().sendSuccess(() -> Component.literal("批次间隔已设为 " + ticks + " tick（会话级，重启失效）。"),
                 false);
+        return 1;
+    }
+
+    /** /autocraft speed <ticks>：统一调整合成速度（0=最快，越大越慢）。 */
+    private static int speed(CommandContext<CommandSourceStack> ctx) {
+        int ticks = IntegerArgumentType.getInteger(ctx, "ticks");
+        Config.setDelayOverride(ticks);
+        Config.setNetworkFillSettleOverride(ticks);
+        ctx.getSource().sendSuccess(() -> Component.literal("合成速度已设为每步等待 " + ticks
+                + " tick（0=最快，会话级，重启失效）。"), false);
         return 1;
     }
 
@@ -101,7 +122,26 @@ public final class AutoCraftCommand {
         return 1;
     }
 
-    private static int runPlan(CommandContext<CommandSourceStack> ctx, boolean openPreview) {
+    /** /autocraft quantity <extra|total>：会话级覆盖数量语义。 */
+    private static int quantity(CommandContext<CommandSourceStack> ctx, boolean extra) {
+        Config.setExtraCountOverride(extra);
+        ctx.getSource().sendSuccess(() -> Component.literal("数量语义已设为："
+                + (extra ? "额外合成数（输入 5 做 5 个新物品）"
+                         : "目标总拥有量（已有 4 个时输入 5 只补 1 个）")
+                + "（会话级，重启失效）。"), false);
+        return 1;
+    }
+
+    /** /autocraft fixnodes <on|off>：会话级覆盖预览树节点固定大小开关。 */
+    private static int fixedNodes(CommandContext<CommandSourceStack> ctx) {
+        boolean on = BoolArgumentType.getBool(ctx, "on");
+        Config.setFixedNodeSizeOverride(on);
+        ctx.getSource().sendSuccess(() -> Component.literal("预览树节点固定大小已"
+                + (on ? "开启" : "关闭") + "（默认关闭；会话级，重启失效）。"), false);
+        return 1;
+    }
+
+    private static int runPlan(CommandContext<CommandSourceStack> ctx, boolean executeAfterReport) {
         ResourceLocation itemId = ResourceLocationArgument.getId(ctx, "item");
         CommandSourceStack source = ctx.getSource();
         try {
@@ -113,9 +153,13 @@ public final class AutoCraftCommand {
             }
             RegistryAccess registryAccess = source.getLevel().registryAccess();
             RecipeManager manager = source.getLevel().getRecipeManager();
-            ImmutableRecipeGraph graph = RecipeIndex.graph(manager, registryAccess);
-            Map<MaterialRef, Integer> stock = RecipeIndex.snapshotInventory(player);
+            ImmutableRecipeGraph graph = RecipeIndex.craftingGraph(manager, registryAccess);
+            Map<MaterialRef, Integer> stock = new java.util.HashMap<>(RecipeIndex.snapshotInventory(player));
             MaterialRef target = MaterialRef.of(itemId.toString());
+            // 默认额外合成数：忽略目标物品已有库存；/autocraft quantity total 可切回总拥有量。
+            if (Config.extraCount()) {
+                stock.remove(target);
+            }
             List<IngredientRef> roots = List.of(IngredientRef.of(target, 1));
             Result result = PureSearchPlanner.resolve(graph, stock, roots,
                     Config.maxSteps(), Config.maxSearchStates(),
@@ -124,9 +168,9 @@ public final class AutoCraftCommand {
                     Config.allowCrossLayer());
 
             source.sendSuccess(() -> Component.literal(report(result)), false);
-            if (result.feasible() && openPreview) {
-                // 切回客户端线程：走统一下单入口（黑名单/预览/数量）
-                Minecraft.getInstance().execute(() -> OrderTrigger.orderFromTarget(itemId, 1));
+            if (executeAfterReport) {
+                // 切回客户端线程：复用服务端线程已算好的 result，走统一下单入口（黑名单/预览/执行），避免二次规划。
+                Minecraft.getInstance().execute(() -> OrderTrigger.orderPrecomputed(target, 1, result));
             }
         } catch (Exception e) {
             source.sendSuccess(() -> Component.literal("规划出错: " + e), false);

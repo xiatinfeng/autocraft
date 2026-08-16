@@ -4,7 +4,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import com.adimn.autocraft.compat.EmiGuard;
 import com.adimn.autocraft.config.Config;
 import com.adimn.autocraft.craft.CraftExecutor;
 import com.adimn.autocraft.index.RecipeIndex;
@@ -18,29 +17,21 @@ import com.adimn.autocraft.plan.PlanTree;
 import com.adimn.autocraft.ui.PlanPreviewScreen;
 import com.adimn.autocraft.ui.TreeLine;
 import com.adimn.autocraft.util.Log;
-
-import dev.emi.emi.api.EmiApi;
-import dev.emi.emi.api.stack.EmiStack;
-import dev.emi.emi.api.stack.EmiStackInteraction;
+import com.adimn.autocraft.util.NbtDisplay;
 
 import net.minecraft.client.Minecraft;
-import net.minecraft.network.chat.Component;
-import net.minecraft.resources.ResourceLocation;
-import net.minecraft.world.inventory.CraftingMenu;
-import net.minecraft.world.item.Item;
-import net.minecraft.world.item.ItemStack;
-import net.minecraftforge.registries.ForgeRegistries;
 
 /**
  * 触发层统一下单入口（M4/M5 重构）：
- *   order(target, count)  —— 黑名单检查 → 规划 → 预览确认 → 执行
- *   plan(target, count)   —— 客户端线程规划（预览数量切换时复用）
- *   buildTree(...)        —— 自写配方树（PlanTree，EMI-free），预览界面展示用
+ *   order(target, count)             —— 黑名单检查 → 规划 → 预览确认 → 执行
+ *   orderPrecomputed(target, count, result) —— 使用已算好的规划结果（命令 craft 路径复用，避免二次规划）
+ *   plan(target, count)              —— 客户端线程规划（预览数量切换时复用）
+ *   buildTree(...)                   —— 自写配方树（PlanTree，EMI-free），预览界面展示用
  *
- * 三条触发路径共用本入口：
- *   ① 合成桌内：B 键 → 当前结果槽产物下单（无需 EMI）
- *   ② 悬停：B 键 + EMI 悬停物品 → 下单
- *   ③ 按钮：EMI 配方屏 "A" 按钮 → 当前配方产出下单
+ * 触发路径：
+ *   ① 命令：/autocraft plan（只报告）、/autocraft craft（报告 + 预览/执行）
+ *   ② 按钮：EMI 配方屏齿轮按钮 → 当前配方产出下单
+ *   ③ 按钮：JEI 配方屏齿轮按钮 → 当前配方产出下单
  * 数量：预览界面可调（1/4/16/64），默认 1。
  *
  * 树已完全自写（PlanTree），不依赖 EMI 的 MaterialTree/BoM ——
@@ -49,53 +40,7 @@ import net.minecraftforge.registries.ForgeRegistries;
 public final class OrderTrigger {
     private OrderTrigger() {}
 
-    /** 按键入口：按优先级尝试 合成桌结果 > EMI 悬停 > 提示。 */
-    public static void orderFromContext() {
-        Minecraft mc = Minecraft.getInstance();
-        if (mc.player == null || mc.level == null) {
-            return;
-        }
-        // ① 合成桌内：当前结果槽有合法产物 → 下单该产物
-        if (mc.player.containerMenu instanceof CraftingMenu menu) {
-            ItemStack result = menu.getSlot(0).getItem();
-            if (!result.isEmpty()) {
-                MaterialRef ref = stackRef(result);
-                if (ref != null) {
-                    order(ref, 1);
-                    return;
-                }
-            }
-        }
-        // ② EMI 悬停
-        if (EmiGuard.isPresent()) {
-            EmiStackInteraction hover = EmiApi.getHoveredStack(true);
-            if (hover != null && !hover.isEmpty()
-                    && hover.getStack() instanceof EmiStack emiStack) {
-                ItemStack stack = emiStack.getItemStack();
-                if (!stack.isEmpty()) {
-                    MaterialRef ref = stackRef(stack);
-                    if (ref != null) {
-                        order(ref, 1);
-                        return;
-                    }
-                }
-            }
-        }
-        // ③ 都不可用 → 提示
-        CraftExecutor.chat("悬停目标物品（EMI/物品栏）或打开合成台后按驱动键。");
-    }
-
-    /** 按 ResourceLocation 下单（命令入口，客户端线程调用）。 */
-    public static void orderFromTarget(ResourceLocation itemId, int count) {
-        Item item = ForgeRegistries.ITEMS.getValue(itemId);
-        if (item == null) {
-            CraftExecutor.chat("未知物品: " + itemId);
-            return;
-        }
-        order(MaterialRef.of(itemId.toString()), count);
-    }
-
-    /** 对目标物品下单：规划 → 预览确认（EMI 配方树 + 数量）→ 执行。 */
+    /** 对目标物品下单：规划 → 预览确认 → 执行。 */
     public static void order(MaterialRef target, int count) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null || mc.level == null) {
@@ -109,30 +54,71 @@ public final class OrderTrigger {
         if (result == null) {
             return;
         }
+        dispatch(target, count, result);
+    }
+
+    /**
+     * 使用已算好的规划结果下单（/autocraft craft 在服务端线程规划后复用，避免二次规划）。
+     * 客户端线程调用。
+     */
+    public static void orderPrecomputed(MaterialRef target, int count, Result result) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            return;
+        }
+        if (Config.blacklistItems().contains(target.itemId())) {
+            CraftExecutor.chat("该物品已在黑名单：" + target);
+            return;
+        }
+        if (result == null) {
+            return;
+        }
+        dispatch(target, count, result);
+    }
+
+    /**
+     * 预览/执行分派：
+     * - 开启预览时，无论可行与否都打开预览（不可行也能查看缺失材料）；
+     * - 关闭预览时，可行直接执行，不可行聊天栏报缺料。
+     */
+    private static void dispatch(MaterialRef target, int count, Result result) {
+        if (Config.showPlanPreview()) {
+            openPreview(target, count, result);
+            return;
+        }
         if (result.feasible()) {
-            if (Config.showPlanPreview()) {
-                openPreview(target, count, result);
-            } else {
-                Log.info("下单执行：" + target + " x" + count + "，共 " + result.steps().size() + " 步");
-                CraftExecutor.start(result.steps());
-            }
+            Log.info("下单执行：" + target + " x" + count + "，共 " + result.steps().size() + " 步");
+            CraftExecutor.start(result.steps());
         } else {
             CraftExecutor.chat("无法自动合成 " + target + "：" + failureText(result));
             Log.warn("下单不可行：" + target + " -> " + result.status() + " missing=" + result.missing());
         }
     }
 
-    /** 打开预览界面（客户端线程）。result 可为 null（内部会重新规划）。 */
+    /**
+     * 打开预览界面（客户端线程）。result 可为 null（内部会重新规划）。
+     * 规划失败（null）才不开；不可行的 Result 同样打开，用于展示缺失材料/数量。
+     */
     public static void openPreview(MaterialRef target, int count, Result result) {
         Minecraft mc = Minecraft.getInstance();
         if (result == null) {
             result = plan(target, count);
-            if (result == null || !result.feasible()) {
+            if (result == null) {
                 return;
             }
         }
         PlanTree.TreeNode root = buildTree(target, count, result);
-        mc.setScreen(new PlanPreviewScreen(mc.screen, target, count, result, root));
+        Map<MaterialRef, Integer> stock = new java.util.HashMap<>();
+        if (mc.player != null) {
+            stock.putAll(RecipeIndex.snapshotInventory(mc.player, mc.player.containerMenu));
+        }
+        // 默认额外合成数：忽略目标物品已有库存；/autocraft quantity total 可切回总拥有量。
+        if (Config.extraCount()) {
+            stock.remove(target);
+        }
+        ImmutableRecipeGraph graph = RecipeIndex.allGraph(
+                mc.level.getRecipeManager(), mc.level.registryAccess());
+        mc.setScreen(new PlanPreviewScreen(mc.screen, target, count, result, root, stock, graph));
     }
 
     /** 客户端线程规划（预览数量切换 / 直接执行共用）。失败返回 null 或不可行 Result。 */
@@ -142,9 +128,14 @@ public final class OrderTrigger {
             return null;
         }
         try {
-            ImmutableRecipeGraph graph = RecipeIndex.graph(
+            ImmutableRecipeGraph graph = RecipeIndex.craftingGraph(
                     mc.level.getRecipeManager(), mc.level.registryAccess());
-            Map<MaterialRef, Integer> stock = RecipeIndex.snapshotInventory(mc.player);
+            Map<MaterialRef, Integer> stock = new java.util.HashMap<>(
+                    RecipeIndex.snapshotInventory(mc.player, mc.player.containerMenu));
+            // 默认额外合成数：忽略目标物品已有库存；/autocraft quantity total 可切回总拥有量。
+            if (Config.extraCount()) {
+                stock.remove(target);
+            }
             List<IngredientRef> roots = List.of(IngredientRef.of(target, count));
             return PureSearchPlanner.resolve(graph, stock, roots,
                     Config.maxSteps(), Config.maxSearchStates(),
@@ -170,9 +161,16 @@ public final class OrderTrigger {
             return null;
         }
         try {
-            ImmutableRecipeGraph graph = RecipeIndex.graph(
+            // 预览树用全配方图：铁砧/熔炉/锻造等特殊配方也能展示真实材料来源，
+            // 即使这些配方不能被 3×3 合成台自动执行。
+            ImmutableRecipeGraph graph = RecipeIndex.allGraph(
                     mc.level.getRecipeManager(), mc.level.registryAccess());
-            Map<MaterialRef, Integer> stock = RecipeIndex.snapshotInventory(mc.player);
+            Map<MaterialRef, Integer> stock = new java.util.HashMap<>(
+                    RecipeIndex.snapshotInventory(mc.player, mc.player.containerMenu));
+            // 默认额外合成数：忽略目标物品已有库存；/autocraft quantity total 可切回总拥有量。
+            if (Config.extraCount()) {
+                stock.remove(target);
+            }
             Set<String> chosen = new java.util.HashSet<>();
             if (result != null && result.feasible()) {
                 for (PureSearchPlanner.PlannedStep step : result.steps()) {
@@ -208,6 +206,12 @@ public final class OrderTrigger {
 
     private static void flattenPlanNode(PlanTree.TreeNode node, int depth, List<TreeLine> out) {
         String label = node.itemName() + " ×" + node.amount();
+        if (node.catalyst()) {
+            label += "（催化剂）";
+        }
+        if (!node.requirementText().isEmpty()) {
+            label += " [" + NbtDisplay.localize(node.requirementText()) + "]";
+        }
         if (node.recipeId() != null) {
             label += "  [" + node.recipeId() + "]";
         }
@@ -248,8 +252,4 @@ public final class OrderTrigger {
         return result.status().name();
     }
 
-    private static MaterialRef stackRef(ItemStack stack) {
-        ResourceLocation key = ForgeRegistries.ITEMS.getKey(stack.getItem());
-        return key != null ? MaterialRef.of(key.toString()) : null;
-    }
 }

@@ -24,8 +24,13 @@ public final class JeiRecipeScreenHandler {
         Screen screen = event.getScreen();
         // 经反射确认类型后再进入 JEI 专属类（避免 JEI 缺失时类加载炸掉）
         if (screen.getClass().getName().equals("mezz.jei.gui.recipes.RecipesGui")) {
-            Log.debug("检测到 JEI 配方屏，添加齿轮按钮：" + screen.getClass().getSimpleName());
-            JeiButtonAdder.addButton(screen, event);
+            Log.info("检测到 JEI 配方屏，准备添加齿轮按钮：" + screen.getClass().getSimpleName());
+            try {
+                JeiButtonAdder.addButton(screen, event);
+                Log.info("JEI 齿轮按钮添加调用完成");
+            } catch (Throwable t) {
+                Log.warn("JEI 齿轮按钮添加失败：" + t);
+            }
         }
     }
 }

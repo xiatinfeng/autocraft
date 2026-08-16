@@ -28,6 +28,8 @@ public class GearButton extends Button {
         boolean hovered = mouseX >= getX() && mouseY >= getY()
                 && mouseX < getX() + width && mouseY < getY() + height;
         int u = hovered ? TEX_SIZE : 0;   // hover 用纯白态
+        // 深色底确保按钮在任何背景下都可见
+        guiGraphics.fill(getX() - 1, getY() - 1, getX() + BUTTON_SIZE + 1, getY() + BUTTON_SIZE + 1, 0xCC000000);
         // blit(tex, x, y, width, height, uOffset, vOffset, uWidth, vHeight, texWidth, texHeight)
         guiGraphics.blit(BUTTONS_TEXTURE, getX(), getY(), BUTTON_SIZE, BUTTON_SIZE,
                 u, 0, TEX_SIZE, TEX_SIZE, TEX_SIZE * 2, TEX_SIZE);

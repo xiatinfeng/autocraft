@@ -451,3 +451,352 @@ CraftExecutor：
 
 ### 9.4 发布评估
 - 创意工坊 / CurseForge：纯客户端 bi-optional（服务端免装）、rs_integration 合规已声明（§0/§8.5）、版本基线 Forge 47.4.0 + EMI 1.1.24
+
+---
+
+## 10. 优化与迭代记录（2026-08-15 后）
+
+> 本章记录 §9 之后的实际改动、踩坑和“没写进代码/暂时没做”的设计。历史设计文档保持原样，不在旧章节里“追改”。
+
+### 10.1 已实现（按主题）
+
+#### 10.1.1 废弃 B 键与 EMI/JEI 双环境修复
+- 删除 `KeyHandler / KeyMappings / TreeDriver / OrderTrigger.orderFromContext / EmiGuard`，B 键、PIN 键、EMI BoM 按住驱动全部移除。
+- 新增 `ClientTicker`：无条件每 tick 驱动 `CraftExecutor`，**不再以 `EmiGuard.isPresent()` 作总闸**——只装 JEI、只装 EMI、两者都不装时命令/按钮都能执行。
+- `AutoCraft` 只注册 `ClientTicker + JeiRecipeScreenHandler + AutoCraftCommand`。
+
+#### 10.1.2 命令优化
+- `/autocraft plan`：只打印规划报告，不执行、不弹预览。
+- `/autocraft craft`：服务端线程规划一次，把 `Result` 交给客户端 `OrderTrigger.orderPrecomputed`，**避免二次规划**。
+- `OrderTrigger` 抽出 `dispatch()`：开启预览时，**可行/不可行都打开预览**，让玩家看到缺失材料。
+
+#### 10.1.3 EMI 配方屏按钮重构（去反射）
+- 删除反射读取 `tabs/tab/page/currentPage` 的 `RecipeScreenButtonHandler`。
+- 新增 `RecipeDisplayMixin`（Mixin 注入 `RecipeDisplay.addButtons` 右侧列）与 `AutoCraftRecipeWidget`（继承 `DrawableWidget`）。
+- 引入 MixinGradle + `autocraft.mixins.json` + jar manifest `MixinConfigs`。
+- 按钮是真正的 EMI Widget，随 `WidgetGroup` 渲染/点击/悬停，翻页自动跟随当前配方。
+
+#### 10.1.4 预览 UI
+- `PlanPreviewScreen`：布局缓存（`TreeLayout`）与物品注册表缓存，避免每帧重复计算。
+- 数量输入框（任意值）+ 清空按钮；回车或点击空白提交。
+- 右侧固定总耗材面板：可滚轮滚动、缺失红/满足绿、悬停 tooltip。
+- 中键/右键单击归正视角到树根；左键拖拽平移、左键点击节点展开备选配方。
+- 树默认长到原材料（即使库存已有也继续展开配方）。
+
+#### 10.1.5 NBT 处理
+- `nbtFingerprint`（默认 true）**只对原版附魔书**做 `StoredEnchantments` 归一化指纹匹配。
+- 预览树/总耗材显示 NBT 需求文字，`NbtDisplay` 做本地化（附魔名如“保护 IV”）。
+- 大 NBT 物品（拔刀剑等）只做展示层需求文字，不参与匹配、不 hash 整个 NBT。
+
+#### 10.1.6 配方图与规划
+- `RecipeIndex` 拆成 `craftingGraph`（执行用，只收 3×3 可执行）与 `allGraph`（预览用，读全部配方类型）。
+- `PlanTree.pickRecipe` 增加**可达性互转环检测**，避免 `永恒锭→永恒块→永恒锭` 循环树。
+- 催化剂/可复用工具：`RecipeNode.catalysts` 独立列表；规划只要求“持有 count 个、不消耗”；`PlanTree` 用 `catalystCache` 实现 **DAG 共享节点**（贤者之石全树只实例化一次）。
+- 可交互备选配方：左键点击带 `+` 的节点，按 `expandedMaterials` 展开该材料的所有配方分支。
+
+### 10.2 踩坑记录（重要）
+
+1. **无 EMI 执行器冻结**
+   - 现象：只装 JEI 时 `CraftExecutor` 不 tick。
+   - 根因：`KeyHandler.onClientTick` 开头 `if (!EmiGuard.isPresent()) return;` 把所有 tick 都 gate 掉了。
+   - 修复：拆出 `ClientTicker`，无条件驱动执行器。
+
+2. **EMI 生产 jar 的“官方类名 + SRG 成员名”**
+   - 现象：直接继承 EMI `Widget` 编译报“未实现 render / m_88315_”双抽象方法。
+   - 根因：ForgeGradle 编译期 `Renderable.render` 是 mojmap，而 libs 内 EMI jar 的 `Widget` 抽象方法是 SRG `m_88315_`。
+   - 修复：改用 EMI 公共 API `DrawableWidget`，只覆写 EMI 自有方法（`mouseClicked/getTooltip`），不触碰 MC 接口方法。
+
+3. **配方只读 CRAFTING 导致特殊配方缺失**
+   - 现象：永恒粒/铁砧配方没进图，预览树出现“9 锭→块→锭”循环假象。
+   - 根因：`RecipeIndex` 只遍历 `RecipeType.CRAFTING`。
+   - 修复：预览树用 `allGraph`（`RecipeManager.getRecipes()`），执行仍用 `craftingGraph`；空输入配方跳过防免费产出。
+
+4. **互转环检测不足**
+   - 现象：永恒锭数量 ≥9 时仍走方块往返。
+   - 根因：只查“配方输入里有没有自身产物”的 2 步自耗，漏掉多步互转。
+   - 修复：`PlanTree` 用深度受限（8）的**可达性搜索**判断“输入能否回到目标物品”。
+
+5. **NBT 全量指纹会爆**
+   - 讨论过给所有物品加完整 NBT 指纹，拔刀剑这类大 NBT 会导致 hash 成本/不稳定。
+   - 结论：只给原版附魔书做指纹，其他物品只展示需求文字。
+
+6. **安全耐久建模被回退**
+   - 尝试“满耐久、每批 1 耐久”的保守估算，但用户实测不满意且没有可靠 API 拿“每次消耗几点耐久”。
+   - 结论：回退；当前可复用工具/催化剂按“持有 1 个不消耗”处理，不估算耐久。
+
+7. **`treeall` 全局全配方展开性能爆炸**
+   - 现象：即使较高配置也会单核卡死。
+   - 结论：废弃全局展开，改为“左键点击节点按需展开该材料备选配方”。
+
+8. **输入框提交导致视角被强制拉回**
+   - 现象：左键单击/拖拽起点视角跳到固定位置。
+   - 根因：输入框聚焦时，空白左键总会 `commitQuantityInput()` → `setQuantity()` → 重建树并强制居中。
+   - 修复：只有输入框聚焦才提交；数字没变不重建不居中。
+
+9. **方案 A 催化剂重复展开被否**
+   - 曾按“每个分支都挂一个贤者之石”实现，数量虽对但用户希望共享单一节点。
+   - 结论：改为 DAG 共享节点（`catalystCache` + 渲染身份去重）。
+
+### 10.3 没写进代码 / 暂时没做的设计
+
+- **完美 DAG 布局**：当前是“数据层 DAG + 视觉树形渲染”，共享节点父分支深度不同时连线可能跨层；未做完整图布局。
+- **精确耐久建模**：需要知道每个 mod 工具“每次合成掉几点耐久”，目前没有统一 API；背包部分耐久聚合、规划期耐久池等设计未落地。
+- **tag 替代物全展开**：一个槽位若 alternatives 很长，目前仍只展示一个替代物（有库存优先/第一个）；全展开可能爆炸，未做。
+- **机器配方执行**：熔炉/烟熏/石切/铁砧只进预览树，不参与自动执行（执行仍限 3×3 合成台）。
+- **背包空间预检**：§7 风险表“背包满”缓解未落地。
+- **失败恢复策略**：失败即停；跳过不可用分支/局部重试未实现。
+- **规划异步化**：CompletableFuture + 主线程降级未实现。
+- **通用 NBT 键本地化**：只本地化了附魔书指纹；拔刀剑等 `key=value` 仍是原文。
+
+### 10.4 终端/背包兼容侦查（2026-08-16，K2 提供源码）
+
+> 目标：评估“终端当合成台 / 精妙背包当原料来源 / 网络当库存”三条路线。
+> 参考源码目录：`ae2-source/`、`rs-source/`、`sophbackpacks-source/`、`sophcore-source/`（第三方参考，不入库）。
+
+#### 10.4.1 EMI 的通用填充机制
+- `EmiRecipeFiller.getAllHandlers`：先查按 `ScreenHandlerType` 注册的自定义 `EmiRecipeHandler`；
+- 无自定义时走 `CoercedRecipeHandler`：**只有菜单里存在原版 `CraftingResultSlot` 且其输入是宽高>0 的 `RecipeInputInventory`**，才会被当作合成台；
+- `getInputSources` = 当前容器所有 enabled 且能放物品的槽位；`clientFill` 用标准容器点击包填充。
+
+#### 10.4.2 AE2（Applied Energistics 2）
+- `CraftingTermMenu` 使用**自定义槽位** `CraftingMatrixSlot` / `CraftingTermSlot`，**不是原版 `CraftingResultSlot`** → EMI 通用兜底识别不了。
+- AE2 自己注册了 EMI handler（`AppEngEmiPlugin` → `EmiUseCraftingRecipeHandler`）：
+  - `getInputSources` = 玩家物品栏 + 快捷栏 + 合成格（**不含网络槽**）；
+  - 网络库存只通过 `getInventory`（ME repo）参与“可合成性判断”，实际填充走 AE2 自己的传输逻辑/包。
+- 结论：
+  - 想用 AE2 终端当合成台，**必须做 AE2 专用适配**（不能靠通用 `CraftingResultSlot` 探测）；
+  - “网络当库存”在 AE2 里不是纯标准点击，需要接 AE2 API/包，属于 mod 专用集成。
+
+#### 10.4.3 RS（Refined Storage）
+- `GridContainerMenu` 使用 `CraftingGridSlot` + `ResultCraftingGridSlot extends ResultSlot`（自定义），**不是原版 `CraftingResultSlot`** → 通用兜底同样识别不了。
+- 当前提供源码里**未见 EMI handler**（有 JEI/REI 适配）。
+- 结论：RS 也需要专用适配；网络库存行为需进一步看 RS 的 transfer handler。
+
+#### 10.4.4 精妙背包 / 精妙核心（Sophisticated Backpacks / Core）
+- `BackpackContainer` 本身没有合成格；合成靠 `CraftingUpgradeContainer`（实现 `ICraftingContainer`）。
+- Sophisticated Core 有 EMI 集成 `EmiGridMenuInfo`：
+  - 通过 `getOpenOrFirstCraftingContainer(recipeType)` 找到背包里的合成升级；
+  - 如果合成升级没打开，会**自动打开合成 Tab**（`setIsOpen(true)` + `setOpenTabId(...)`）；
+  - 然后按标准 EMI fill 填充。
+- 结论：**精妙背包路线最可行**——不需要玩家手动开背包，mod 自动打开背包内的合成升级 Tab，再按标准点击填充。
+
+#### 10.4.5 对后续设计的约束
+1. **“终端当合成台”不是通用能力**：AE2/RS 都用自定义槽位，必须逐 mod 写菜单/槽位适配器。
+2. **“网络当库存”在 AE2/RS 里不是纯客户端标准点击**：需要接 mod 自己的 transfer/包协议；是否保持“纯客户端”取决于这些 mod 的客户端包是否允许。
+3. **精妙背包是最佳第一个适配对象**：参考 Sophisticated Core 的 EMI 集成，自动打开合成升级 Tab 后，我们的执行器只需“通用合成格 + 来源槽 = 玩家物品栏 + 背包槽 + 合成格”即可。
+4. 若未来做终端，建议优先做一个“菜单适配器接口”：`CraftingGridAdapter` 负责返回 网格槽/结果槽/来源槽；AE2/RS 各自实现，原版合成台用默认实现。
+
+### 10.5 终端/背包适配的触发与测试路径（2026-08-16，用户反馈修正）
+
+**问题**：方块/终端 GUI 打开时**无法输入聊天指令**，所以“打开终端 → `/autocraft craft`”不是可行的测试路径。
+
+**实际可行的触发路径**：
+1. 打开终端/背包界面；
+2. 在该界面里打开 JEI/EMI 配方查看；
+3. 点击我们的**自动合成齿轮按钮**（`RecipeScreenHolder.back()` 会返回之前的终端/背包界面）；
+4. 弹出计划预览 → 点「开始合成」；
+5. `CraftExecutor.start()` 在**当前终端/背包菜单**里运行（依赖 `CraftingGridAdapter` 槽位映射）。
+
+**也可以先用 JEI/EMI 的配方填充把网格摆好**，再走齿轮按钮触发；但我们的执行器会按自己的 `sourceSlotIds` 重新扫描/填充，不会依赖 JEI/EMI 已经摆好的网格（除非后续改成“沿用当前网格”模式）。
+
+**第一版测试要点**：
+- RS/AE2：来源槽暂只含玩家物品栏；如果配方原料在网络里，SCAN 会报“材料不足”，需先把原料放玩家背包。
+- 精妙背包：应自动打开合成升级 Tab；来源槽含背包槽 + 玩家物品栏。
+- 原版合成台回归不变。
+
+**后续可选项**：
+- 增加一个“在当前合成格执行”的快捷键/按钮，避免必须从配方屏齿轮进入；
+- 或支持“沿用当前网格”（用户先用 JEI/EMI 摆好，我们只负责 shift 合成/补料）。
+
+### 10.6 RS/AE2 网络库存与网络填格（2026-08-16，已实现）
+
+> 目标：让 RS/AE2 终端里的合成真正使用**网络库存**，而不是只用手上/背包材料。
+> 实现采用反射调用 mod 自带的客户端传输入口，不新增编译期依赖。
+
+#### 10.6.1 适配器能力扩展
+`CraftingGridAdapter` 新增：
+- `usesNetworkFill()`：是否走 mod 网络填格；
+- `fillGrid(menu, recipe)`：让 mod 把配方从网络/存储摆进合成格；
+- `getNetworkItemStacks(menu)`：返回网络/存储中的物品快照（规划用）。
+
+#### 10.6.2 AE2
+- 填格：反射调用 `appeng.integration.modules.jeirei.CraftingHelper.performTransfer(menu, recipe, false)`，由 AE2 服务端包从 ME 网络取料填格。
+- 网络库存：反射读取 `MEStorageMenu.getClientRepo().getAllEntries()`，将 `AEItemKey.toStack(amount)` 计入规划库存。
+
+#### 10.6.3 RS
+- 填格：反射构造 `GridTransferMessage(List<List<ItemStack>>)` 并通过 `RS.NETWORK_HANDLER.sendToServer` 发送，RS 服务端从网络取料填格。
+- 网络库存：反射读取 `GridScreen.getView().getStacks()`，将 `IGridStack.getIngredient()` + `getQuantity()` 计入规划库存。
+
+#### 10.6.4 执行器
+- `CraftExecutor` 对 `usesNetworkFill()` 的适配器：每步前调用 `fillGrid`，然后跳过手动 `SCAN/PICKUP`，直接等网格同步 → 轮询结果槽 → shift 合成。
+- 这样避免我们自己去摸 RS/AE2 网络槽位，交给 mod 自己的传输逻辑。
+
+#### 10.6.5 已知风险 / 待用户实测
+- 反射依赖 mod 内部类/方法，**mod 版本升级可能失效**：
+  - AE2 `CraftingHelper` 在 `integration.modules.jeirei`，属于内部实现；
+  - RS `GridTransferMessage` / `GridScreen.getView()` 也非稳定 API。
+- RS 网络库存依赖 `GridScreen` 已初始化；终端刚打开或未刷出列表时可能读到空表。
+- 用户已开始实测，若有问题需在新会话里根据日志继续修（“网络填格失败 / 网络库存快照失败 / 槽位识别失败”等日志关键字）。
+
+
+---
+
+## 11. 小细节优化与待办（2026-08-16 记录）
+
+> 本节记录“已完成但值得保留的小优化”和“已知待优化项/限制”，避免后续会话丢失上下文。
+
+### 11.1 已完成的小细节优化
+
+1. **预览树中间产物折叠**
+   - 中间产物库存足够时不再展开原材料，直接显示绿色叶子。
+   - 手动点击节点仍可展开完整配方链。
+
+2. **总耗材“或”等价显示**
+   - 支持如 `4× 紫水晶簇 或 24× 紫水晶碎片`。
+   - 等价物单独一行并显示图标，不遮挡数量。
+   - 悬停提示“需手动获取，AutoCraft 不自动执行”。
+
+3. **手动加工标记**
+   - 非工作台节点加红色边框。
+   - 旁边显示加工方块图标（熔炉/高炉/烟熏炉/营火/切石机/锻造台/挖掘等）。
+   - 悬停提示“此物品需要通过 XX 手动加工，AutoCraft 不会自动执行”。
+
+4. **mod 特殊加工动态图标（EMI）**
+   - 通过 EMI 按输出物品查配方类别，再取该类别的 workstation 作为图标。
+   - 已实测：Create `crushing_wheel`、`mechanical_mixer` 等能显示。
+
+5. **预览界面按 A 加入收藏**
+   - 悬停树节点/总耗材条目按 `A`。
+   - 优先 EMI `EmiFavorites.addFavorite`，失败/未装时尝试 JEI 内部 `BookmarkList` 反射。
+   - 聊天栏有成功/失败反馈。
+
+6. **合成速度指令**
+   - `/autocraft speed <ticks>`：统一调整批次间隔 + 网络填格等待。
+   - `0` = 最快；会话级生效。
+
+7. **数量语义指令**
+   - 默认“额外合成数”（输入 5 做 5 个新物品）。
+   - `/autocraft quantity extra|total` 可热切换。
+
+8. **原版合成台提速**
+   - 从逐槽点击改为 `ServerboundPlaceRecipePacket` 配方书一键填格。
+
+9. **精妙背包提速**
+   - 从逐槽点击改为 Sophisticated Core `TransferRecipeMessage` 传输填格。
+
+10. **执行器可靠性修复**
+   - RS 配方形状正确映射（木棍不再变成压力板）。
+   - 非网络路径不再误用网络批次值。
+   - SYNC 超时日志保留真实步骤/网格内容。
+   - Sophisticated 虚拟槽点击改走原始 `ServerboundContainerClickPacket`，避免崩溃。
+
+### 11.2 待优化项
+
+1. **配方选择优先级**
+   - 例如红石明显“挖掘获取更快”，但配方树可能优先显示高炉熔炼。
+   - 后续可加“手动获取优先级”或把挖掘/掉落也作为备选展示。
+
+2. **手动等价表扩展**
+   - 目前仅内置 `minecraft:amethyst_cluster -> minecraft:amethyst_shard ×6（挖掘）`。
+   - 其他“掉落/手动换算”可继续在 `ManualProcessing.DROP_EQUIVALENCES` 中扩展。
+
+3. **JEI 书签反射稳定性**
+   - JEI 收藏走内部类反射，版本升级可能失效。
+   - 当前 EMI 优先，JEI 为兜底。
+
+4. **JEI-only 环境的 mod 动态图标**
+   - **JEI 本身没有 EMI 风格的配方树 / BoM / 总耗材树**，只有配方类别图标与工作方块（catalyst）。
+   - 当前动态图标读取优先 EMI。
+   - 只装 JEI 时，mod 特殊加工可能只有红框没有图标，后续可接 JEI `IRecipeCategory.getIcon()` / `IRecipeCatalystLookup` 作为图标来源。
+
+5. **总耗材面板占用空间过大**
+   - 当前总耗材容器在 UI 上占的空间偏大，后续需要做布局优化（例如更紧凑的行高、可折叠、字号缩小、或改为 tooltip 聚合）。
+
+### 11.3 已知限制（有意识保留）
+
+1. **RS/精妙背包批量仍是“逐批填格”**
+   - RS 从玩家背包回退时一次只拿 1 份，不能安全地一次填多份。
+   - 纯网络材料场景后续可做“网络库存足够才批量填格”的优化。
+
+2. **非工作台加工只提示、不执行**
+   - 熔炉/高炉/锻造/挖掘等不会自动执行，这是刻意设计，避免误导玩家。
+
+3. **AutoCraft 仍是纯客户端 mod**
+   - 服务端不需要安装 AutoCraft。
+   - RS/精妙背包功能依赖服务器已安装对应 mod；原版合成台功能在纯原版服务器可用。
+
+
+---
+
+## 12. UI/兼容性迭代（2026-08-16 晚记录）
+
+### 12.1 预览树节点可读性
+
+- 节点默认跟随缩放，保留原版缩放手感。
+- 当 `zoom < 0.55` 时，自动将节点图标/数量文字切为**屏幕固定大小**，避免缩小后不可读/消失。
+- 提供指令 `/autocraft fixnodes on|off` 可强制全程固定或关闭自动切换。
+- 默认 `fixedNodeSize=false`。
+
+### 12.2 总耗材面板宽度
+
+- 总耗材面板宽度从 `180px` 调整为 `80px`，显著缩小占用。
+- 行高保持原样，不再通过压行高解决。
+- 若后续“或”等价显示在 80px 内放不下，可再调整布局。
+
+### 12.3 加工图标回退策略修正
+
+- 移除了“产物本身是方块就用产物当加工图标”的回退。
+- 原因：沙子等产物会导致“用沙子加工沙子”的误导。
+- 现在查不到 EMI/JEI 工作方块时，只显示红色边框 + “需手动加工”提示。
+- 挖掘/掉落等价仍通过 `ManualProcessing.DROP_EQUIVALENCES` 使用固定稿子图标。
+
+### 12.4 JEI 配方页按钮
+
+- **问题**：JEI `RecipesGui.render()` 不渲染 `Screen.renderables`，`ScreenEvent.Init.Post` 添加的按钮不可见。
+- **方案**：Mixin 注入 `RecipesGui` 的 `render` / `mouseClicked`。
+- 通过反射读取 `RecipeGuiLayouts.recipeLayoutsWithButtons`，计算每张配方右侧“下一个侧边按钮”的位置，把齿轮画在书签/转移按钮同一列。
+- 点击时通过 `IRecipeLayoutDrawable` 取配方 ID → 产出 → 下单。
+- 兼容 JEI 15.8/15.49 等版本的 SRG/官方方法名差异（同时匹配 `m_88315_`/`render`、`m_6375_`/`mouseClicked`）。
+
+### 12.5 EMI 配方页按钮
+
+- EMI **没有生产可用的官方额外按钮 API**（`addRecipeDecorator` 仅开发环境）。
+- 继续使用 Mixin 注入 `RecipeDisplay.addButtons`，把齿轮按钮加入 EMI 右侧按钮列。
+- 若后续 EMI 提供正式 API，再考虑替换。
+
+### 12.6 已知后续优化
+
+- JEI 15.38+ 有官方 `IRecipeButtonControllerFactory` / `IIconButtonController`，但当前编译基线 JEI 15.20 不包含该 API，暂未使用；后续升级编译基线后可替换 Mixin 方案。
+- 总耗材 80px 宽度下，“或”等价行可能需要进一步压缩或改为 tooltip 展示。
+
+
+---
+
+## 13. 开发待办 / 已知问题（2026-08-17 记录）
+
+### 13.1 预览树“间断/虚空引用”（dangling edge）—— 待修复
+
+**现象**：
+- 配方树中部分连线穿过空位置，但该位置没有节点（无图标、无数量文字）。
+- 截图反馈：连线还在，节点缺失；偶发“悬空 ×1”。
+- 深树和催化剂/共享中间产物场景更容易出现。
+
+**已尝试的方案（均未彻底解决）**：
+1. 布局阶段对共享节点去重（`layoutPositions` 增加 `placed` 集合，按对象身份只布局一次）。
+   - 结果：仍有间断/虚空引用。
+2. 将催化剂/共享中间产物改为“每条路径独立节点”（EMI 同款，不再共享 `TreeNode`）。
+   - 结果：仍有该 bug，说明问题不仅来自共享节点。
+
+**后续方向**：
+- 深入核对 `collectLevels` / `layoutPositions` 与 `drawConnections` 的坐标一致性。
+- 重点检查：
+  - `centers` 与 `ys` 是否覆盖所有 `children`；
+  - 父子节点是否可能因为 `expandedMaterials` 多配方分支、环保护返回空 children 但仍有连线；
+  - `pickRecipe` 返回 null / 环保护节点是否错误地参与连线布局。
+- 必要时参考 EMI `BoMScreen` 的完整布局算法（Reingold-Tilford 风格）重写预览树布局。
+- 也可以考虑临时降级：遇到无法可靠布局的树时回退为平面步骤列表。
+
+### 13.2 已记录但未做的 UI/体验优化
+
+- 总耗材 80px 宽度下，“或”等价行可能显示拥挤，后续可改为 tooltip 或更紧凑布局。
+- JEI 官方额外按钮 API（15.38+）暂未使用，当前编译基线 JEI 15.20 不包含；后续升级基线后可替换 Mixin。

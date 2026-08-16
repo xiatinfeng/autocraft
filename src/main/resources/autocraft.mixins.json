@@ -1,0 +1,15 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "com.adimn.autocraft.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "autocraft.refmap.json",
+  "client": [
+    "RecipeDisplayMixin",
+    "JeiRecipesGuiMixin"
+  ],
+  "mixins": [],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}

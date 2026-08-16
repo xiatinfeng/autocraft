@@ -2,18 +2,30 @@ package com.adimn.autocraft.ui;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
+import com.adimn.autocraft.config.Config;
 import com.adimn.autocraft.craft.CraftExecutor;
+import com.adimn.autocraft.plan.ImmutableRecipeGraph;
 import com.adimn.autocraft.plan.MaterialRef;
 import com.adimn.autocraft.plan.PlanTree;
+import com.adimn.autocraft.plan.PureSearchPlanner;
 import com.adimn.autocraft.plan.PureSearchPlanner.Result;
+import com.adimn.autocraft.plan.RecipeNode;
 import com.adimn.autocraft.trigger.OrderTrigger;
+import com.adimn.autocraft.util.FavoriteAdder;
 import com.adimn.autocraft.util.Log;
+import com.adimn.autocraft.util.ManualProcessing;
+import com.adimn.autocraft.util.NbtDisplay;
+import com.adimn.autocraft.util.ProcessingIconProvider;
 
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
@@ -22,6 +34,8 @@ import net.minecraft.client.gui.components.AbstractWidget;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
+
+import org.lwjgl.glfw.GLFW;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.Item;
@@ -50,7 +64,10 @@ public final class PlanPreviewScreen extends Screen {
     private static final int CONTENT_TOP = 70;
     private static final int TOTAL_SECTION_PAD = 16;
     private static final int BOTTOM_BUTTON_RESERVE = 56;
-    private static final double MIN_ZOOM = 0.3;
+    private static final int TOTALS_REGION_WIDTH = 80;
+    private static final int TOTALS_MARGIN = 8;
+    private static final int TOTALS_ITEM_GAP = 6;
+    private static final double MIN_ZOOM = 0.6;
     private static final double MAX_ZOOM = 3.0;
     private static final double ZOOM_STEP = 1.1;
 
@@ -58,11 +75,17 @@ public final class PlanPreviewScreen extends Screen {
 
     private final Screen previous;
     private final MaterialRef target;
+    private final ImmutableRecipeGraph graph;
+    private final Map<MaterialRef, Integer> stock;
+    private final Set<String> chosenRecipes;
+    private final Set<String> expandedMaterials = new HashSet<>();
     private int quantity;
     private Result result;
     private PlanTree.TreeNode root;
     private Map<MaterialRef, Long> totals;
     private String error;
+    private EditBox quantityInput;
+    private double totalsScrollY;
 
     // 视图状态（缩放 + 平移）
     private double zoom = 1.0;
@@ -72,15 +95,30 @@ public final class PlanPreviewScreen extends Screen {
     private PlanTree.TreeNode hoveredNode;   // 当前悬停节点（tooltip）
     private Map.Entry<MaterialRef, Long> hoveredTotal;   // 当前悬停的总耗材（tooltip）
 
+    /** 树布局缓存：只在树结构变化（首次打开 / 数量切换）时重建，渲染期只读。 */
+    private TreeLayout layout;
+    /** 物品注册表缓存：避免每帧每节点 ForgeRegistries 查找。 */
+    private final Map<String, Item> itemCache = new HashMap<>();
+
     public PlanPreviewScreen(Screen previous, MaterialRef target, int quantity,
-                             Result result, PlanTree.TreeNode root) {
+                             Result result, PlanTree.TreeNode root,
+                             Map<MaterialRef, Integer> stock, ImmutableRecipeGraph graph) {
         super(Component.literal("AutoCraft 计划预览"));
         this.previous = previous;
         this.target = target;
         this.quantity = Math.max(1, quantity);
         this.result = result;
         this.root = root;
+        this.stock = stock == null ? Map.of() : stock;
+        this.graph = graph;
+        this.chosenRecipes = new HashSet<>();
+        if (result != null && result.feasible()) {
+            for (PureSearchPlanner.PlannedStep step : result.steps()) {
+                chosenRecipes.add(step.recipeId());
+            }
+        }
         this.totals = root == null ? Map.of() : PlanTree.totalLeafDemand(root);
+        rebuildLayout();
     }
 
     @Override
@@ -92,6 +130,17 @@ public final class PlanPreviewScreen extends Screen {
                     .bounds(qx, 40, 34, 18).build());
             qx += 40;
         }
+        // 自定义数量输入框：输入后按回车或点击空白处更新计划/缺失材料。
+        quantityInput = new EditBox(font, qx + 4, 40, 60, 18, Component.literal("数量"));
+        quantityInput.setMaxLength(6);
+        quantityInput.setValue(String.valueOf(quantity));
+        quantityInput.setFocused(false);
+        addRenderableWidget(quantityInput);
+        // 清空输入框：方便重新输入自定义数量。
+        addRenderableWidget(Button.builder(Component.literal("清空"), button -> {
+            quantityInput.setValue("");
+            quantityInput.setFocused(true);
+        }).bounds(qx + 4 + 60 + 4, 40, 40, 18).build());
         int buttonWidth = 90;
         int buttonHeight = 20;
         int gap = 8;
@@ -118,16 +167,21 @@ public final class PlanPreviewScreen extends Screen {
         int maxY = height - BOTTOM_BUTTON_RESERVE;
         hoveredNode = null;
         hoveredTotal = null;
+        if (result != null && !result.feasible()) {
+            // 材料不足也打开预览：提示行下方继续渲染配方树，红色节点/总耗材即缺失项。
+            g.drawCenteredString(font, "当前数量 " + quantity + " 不可行，红色 = 缺失材料", width / 2, 58, 0xFF5555);
+        }
         if (root != null) {
             renderLayeredTree(g, root, maxY, mouseX, mouseY);
-            // tooltip 必须在 pose.popPose() 之后（屏幕坐标）
-            if (hoveredNode != null) {
-                renderNodeTooltip(g, hoveredNode, mouseX, mouseY);
-            } else if (hoveredTotal != null) {
-                renderTotalTooltip(g, hoveredTotal, mouseX, mouseY);
-            }
-        } else if (result != null && result.feasible()) {
+        } else if (result != null) {
             renderFlatFallback(g, maxY);
+        }
+        renderTotalsPanel(g, mouseX, mouseY);
+        // tooltip 必须在 pose.popPose() 之后（屏幕坐标）
+        if (hoveredNode != null) {
+            renderNodeTooltip(g, hoveredNode, mouseX, mouseY);
+        } else if (hoveredTotal != null) {
+            renderTotalTooltip(g, hoveredTotal, mouseX, mouseY);
         }
         super.render(g, mouseX, mouseY, partialTick);
     }
@@ -138,6 +192,13 @@ public final class PlanPreviewScreen extends Screen {
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double amount) {
+        // 总耗材区域内滚轮 → 上下滚动总耗材列表
+        if (inTotalsRegion(mouseX, mouseY)) {
+            totalsScrollY -= amount * 16.0;
+            double maxScroll = Math.max(0.0, totalsScrollMax());
+            totalsScrollY = clamp(totalsScrollY, 0.0, maxScroll);
+            return true;
+        }
         if (root == null) {
             return super.mouseScrolled(mouseX, mouseY, amount);
         }
@@ -158,12 +219,136 @@ public final class PlanPreviewScreen extends Screen {
 
     @Override
     public boolean mouseDragged(double mouseX, double mouseY, int button, double dx, double dy) {
-        if (button == 0 && root != null && !isOverButton(mouseX, mouseY)) {
+        if (button == 0 && root != null && !isOverButton(mouseX, mouseY)
+                && !inTotalsRegion(mouseX, mouseY)) {
             panX += dx;
             panY += dy;
             return true;
         }
         return super.mouseDragged(mouseX, mouseY, button, dx, dy);
+    }
+
+    /** 左键点击节点：展开/收起该材料的其他配方；点空白：提交数量；中键/右键：视角归正。 */
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if ((button == 1 || button == 2) && root != null
+                && !isOverButton(mouseX, mouseY) && !inTotalsRegion(mouseX, mouseY)) {
+            resetViewToRoot();
+            return true;
+        }
+        if (button == 0 && root != null && !isOverButton(mouseX, mouseY)
+                && !inTotalsRegion(mouseX, mouseY)) {
+            PlanTree.TreeNode clicked = findNodeAt(mouseX, mouseY);
+            if (clicked != null) {
+                toggleExpandedFor(clicked.material());
+                return true;
+            }
+            // 只有输入框聚焦时才提交数量，避免拖拽起点/普通空白点击触发重建+回中。
+            if (quantityInput != null && quantityInput.isFocused()) {
+                commitQuantityInput();
+            }
+        }
+        return super.mouseClicked(mouseX, mouseY, button);
+    }
+
+    /** 点击节点：若该材料有多个配方则切换“展开备选配方”；否则无操作。 */
+    private void toggleExpandedFor(MaterialRef material) {
+        if (graph.recipesFor(material).size() <= 1) {
+            return;
+        }
+        String key = material.itemId();
+        if (!expandedMaterials.remove(key)) {
+            expandedMaterials.add(key);
+        }
+        rebuildTree(false);   // 展开/收起备选配方时保留当前视角，不强制回中
+    }
+
+    /** 在树布局中查找鼠标命中的节点（用于点击展开备选配方）。 */
+    private PlanTree.TreeNode findNodeAt(double mouseX, double mouseY) {
+        if (layout == null) {
+            return null;
+        }
+        for (PlanTree.TreeNode n : layout.centers.keySet()) {
+            int cx = (int) Math.round(layout.centers.get(n));
+            int y = layout.ys.get(n);
+            if (hitTest(cx, y, mouseX, mouseY)) {
+                return n;
+            }
+        }
+        return null;
+    }
+
+    /** 中键/右键单击：缩放复位到 1.0，并把树根居中到左侧视图区。 */
+    private void resetViewToRoot() {
+        ensureView();
+        if (layout == null) {
+            return;
+        }
+        zoom = 1.0;
+        panX = (treeViewWidth() - layout.treeWidth) / 2.0;
+        panY = 40.0;
+    }
+
+    /** 回车：提交输入框中的自定义数量。A：把悬停的缺失材料加入 EMI/JEI 收藏。 */
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if ((keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER)
+                && quantityInput != null && quantityInput.isFocused()) {
+            commitQuantityInput();
+            return true;
+        }
+        if (keyCode == GLFW.GLFW_KEY_A && (quantityInput == null || !quantityInput.isFocused())) {
+            MaterialRef target = hoveredMaterial();
+            Log.info("预览界面 A 键：hoveredNode=" + (hoveredNode == null ? "null" : hoveredNode.material())
+                    + " hoveredTotal=" + (hoveredTotal == null ? "null" : hoveredTotal.getKey()));
+            if (target != null) {
+                boolean ok = FavoriteAdder.addFavorite(target.itemId());
+                CraftExecutor.chat(ok
+                        ? "已将 " + target.itemId() + " 加入收藏（EMI/JEI）"
+                        : "无法加入收藏：" + target.itemId());
+                return true;
+            } else {
+                CraftExecutor.chat("请先悬停一个材料再按 A 加入收藏。");
+                return true;
+            }
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    /** 当前悬停的是树节点还是总耗材条目；都没有返回 null。 */
+    private MaterialRef hoveredMaterial() {
+        if (hoveredNode != null) {
+            return hoveredNode.material();
+        }
+        if (hoveredTotal != null) {
+            return hoveredTotal.getKey();
+        }
+        return null;
+    }
+
+    /** 读取输入框数字并刷新计划/缺失材料；空或非法不改变当前数量。 */
+    private void commitQuantityInput() {
+        if (quantityInput == null) {
+            return;
+        }
+        String text = quantityInput.getValue().trim();
+        quantityInput.setFocused(false);
+        if (text.isEmpty()) {
+            return;
+        }
+        try {
+            int q = Integer.parseInt(text);
+            if (q > 0) {
+                // 数字没变就不重建/不居中，避免空白点击或拖拽起点拉视角。
+                if (q != quantity) {
+                    setQuantity(q);
+                }
+            } else {
+                CraftExecutor.chat("数量必须是正整数。");
+            }
+        } catch (NumberFormatException e) {
+            CraftExecutor.chat("请输入正整数数量。");
+        }
     }
 
     /** 判断鼠标是否在控件（数量/按钮）上——拖拽平移只对树区域生效。 */
@@ -182,22 +367,13 @@ public final class PlanPreviewScreen extends Screen {
 
     private void renderLayeredTree(GuiGraphics g, PlanTree.TreeNode root, int maxY,
                                    int mouseX, int mouseY) {
-        // 缓存鼠标坐标（renderTotalsRow 也要用）
-        this.mouseXCache = mouseX;
-        this.mouseYCache = mouseY;
         ensureView();
-        List<List<PlanTree.TreeNode>> levels = collectLevels(root);
-        Map<PlanTree.TreeNode, Double> centers = new HashMap<>();
-        layoutPositions(root, 0.0, centers);
-
-        // y 坐标：每层一行
-        Map<PlanTree.TreeNode, Integer> ys = new HashMap<>();
-        for (int i = 0; i < levels.size(); i++) {
-            int y = CONTENT_TOP + i * V_GAP;
-            for (PlanTree.TreeNode n : levels.get(i)) {
-                ys.put(n, y);
-            }
+        if (layout == null) {
+            return;
         }
+        List<List<PlanTree.TreeNode>> levels = layout.levels;
+        Map<PlanTree.TreeNode, Double> centers = layout.centers;
+        Map<PlanTree.TreeNode, Integer> ys = layout.ys;
 
         // 视图变换：先平移再缩放（布局坐标 → 屏幕坐标）
         var pose = g.pose();
@@ -205,30 +381,32 @@ public final class PlanPreviewScreen extends Screen {
         pose.translate((float) panX, (float) panY, 0);
         pose.scale((float) zoom, (float) zoom, 1.0f);
 
-        // 画连接线（在节点之前，避免覆盖图标）
+        // 画连接线（在节点之前，避免覆盖图标）；连接线随缩放走
         for (PlanTree.TreeNode n : centers.keySet()) {
             drawConnections(g, n, centers, ys);
         }
 
-        // 画节点 + 收集悬停命中（布局坐标转屏幕坐标判断）
+        boolean fixedNodes = Config.fixedNodeSize();
         for (PlanTree.TreeNode n : centers.keySet()) {
             int cx = (int) Math.round(centers.get(n));
             int y = ys.get(n);
-            if (y + ICON_SIZE <= maxY) {
+            int sx = (int) Math.round(cx * zoom + panX);
+            int sy = (int) Math.round(y * zoom + panY);
+            int nodeScreenSize = (int) Math.ceil(ICON_SIZE * (fixedNodes ? 1.0 : zoom));
+            if (sy + nodeScreenSize < 0 || sy > maxY) {
+                continue;
+            }
+            if (!fixedNodes) {
+                // 默认：节点跟随缩放一起变换（原版手感）
                 drawNode(g, n, cx, y);
-                if (hoveredNode == null && hitTest(cx, y, mouseX, mouseY)) {
-                    hoveredNode = n;
-                }
+            } else {
+                // 可选：节点图标/文字固定屏幕大小，不随缩放变化
+                drawNode(g, n, sx, sy);
+            }
+            if (hoveredNode == null && hitTest(cx, y, mouseX, mouseY)) {
+                hoveredNode = n;
             }
         }
-
-        // 总耗材行
-        int treeBottom = CONTENT_TOP + levels.size() * V_GAP;
-        int totalY = treeBottom + TOTAL_SECTION_PAD;
-        if (totalY + ICON_SIZE <= maxY && !totals.isEmpty()) {
-            renderTotalsRow(g, totalY, maxY);
-        }
-
         pose.popPose();
     }
 
@@ -241,23 +419,88 @@ public final class PlanPreviewScreen extends Screen {
                 && mouseY >= sy - half && mouseY <= sy + half;
     }
 
-    /** 首次渲染时把树居中于屏幕（视口初始化一次）。 */
+    /** 树视图可用宽度（左侧区域，右侧留给总耗材面板）。 */
+    private int treeViewWidth() {
+        return Math.max(80, totalsX() - TOTALS_MARGIN);
+    }
+
+    /** 总耗材面板右边界起点。 */
+    private int totalsX() {
+        return width - TOTALS_REGION_WIDTH - TOTALS_MARGIN;
+    }
+
+    private int totalsY() {
+        return CONTENT_TOP;
+    }
+
+    private int totalsHeight() {
+        return Math.max(40, height - BOTTOM_BUTTON_RESERVE - totalsY() - TOTALS_MARGIN);
+    }
+
+    private boolean inTotalsRegion(double mouseX, double mouseY) {
+        return mouseX >= totalsX() && mouseX <= totalsX() + TOTALS_REGION_WIDTH
+                && mouseY >= totalsY() && mouseY <= totalsY() + totalsHeight();
+    }
+
+    /** 总耗材列表可滚动高度上限。 */
+    private double totalsScrollMax() {
+        int headerH = 20;
+        double total = 0.0;
+        for (Map.Entry<MaterialRef, Long> e : totals.entrySet()) {
+            total += totalsRowHeight(e);
+        }
+        return Math.max(0.0, total - (totalsHeight() - headerH));
+    }
+
+    /** 有“或”等价物的条目占两行，普通条目占一行。 */
+    private int totalsRowHeight(Map.Entry<MaterialRef, Long> e) {
+        boolean hasEq = !ManualProcessing.equivalences(e.getKey().itemId()).isEmpty();
+        return ICON_SIZE + TOTALS_ITEM_GAP + (hasEq ? 8 : 0);
+    }
+
+    /** 首次渲染时把树居中于左侧视图区（视口初始化一次）。 */
     private void ensureView() {
-        if (viewInitialized || root == null) {
+        if (viewInitialized || layout == null) {
             return;
         }
-        Map<PlanTree.TreeNode, Double> centers = new HashMap<>();
-        double treeWidth = layoutPositions(root, 0.0, centers);
-        panX = (width - treeWidth) / 2.0;
+        panX = (treeViewWidth() - layout.treeWidth) / 2.0;
         panY = 40.0;
         viewInitialized = true;
     }
 
-    /** BFS 分层：levels[0]=根，levels[1]=根的子层，...。 */
-    private List<List<PlanTree.TreeNode>> collectLevels(PlanTree.TreeNode root) {
+    /** 重建树布局缓存（构造 / 数量切换后调用，默认重置视角居中）。 */
+    private void rebuildLayout() {
+        rebuildLayout(true);
+    }
+
+    /** 重建树布局缓存；resetView=false 时保留当前 pan/zoom（用于展开/收起备选配方）。 */
+    private void rebuildLayout(boolean resetView) {
+        layout = root == null ? null : new TreeLayout(root);
+        if (resetView) {
+            viewInitialized = false;
+        }
+    }
+
+    /** 按当前数量/展开集合重建整棵预览树（保留配方图与库存）。 */
+    private void rebuildTree() {
+        rebuildTree(true);
+    }
+
+    /** recenter=true 时重建后重新居中到树根；false 时保留当前视角。 */
+    private void rebuildTree(boolean recenter) {
+        root = PlanTree.build(graph, target, quantity, stock, chosenRecipes, expandedMaterials);
+        totals = root == null ? Map.of() : PlanTree.totalLeafDemand(root);
+        totalsScrollY = 0;
+        rebuildLayout(recenter);
+    }
+
+    /** BFS 分层：levels[0]=根，levels[1]=根的子层，...；共享节点（DAG 催化剂）按对象身份只入队一次。 */
+    private static List<List<PlanTree.TreeNode>> collectLevels(PlanTree.TreeNode root) {
         List<List<PlanTree.TreeNode>> levels = new ArrayList<>();
         Deque<PlanTree.TreeNode> queue = new ArrayDeque<>();
+        Set<PlanTree.TreeNode> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         queue.add(root);
+        seen.add(root);
         while (!queue.isEmpty()) {
             int size = queue.size();
             List<PlanTree.TreeNode> level = new ArrayList<>(size);
@@ -265,7 +508,11 @@ public final class PlanPreviewScreen extends Screen {
                 PlanTree.TreeNode n = queue.poll();
                 level.add(n);
                 if (n.children() != null) {
-                    queue.addAll(n.children());
+                    for (PlanTree.TreeNode child : n.children()) {
+                        if (seen.add(child)) {
+                            queue.add(child);
+                        }
+                    }
                 }
             }
             levels.add(level);
@@ -274,8 +521,13 @@ public final class PlanPreviewScreen extends Screen {
     }
 
     /** Reingold-Tilford 简化：后序遍历算每个节点中心 x，子树宽度 = max(节点宽, 子树宽之和 + gap)。 */
-    private double layoutPositions(PlanTree.TreeNode node, double leftBoundary,
-                                   Map<PlanTree.TreeNode, Double> centers) {
+    private static double layoutPositions(PlanTree.TreeNode node, double leftBoundary,
+                                          Map<PlanTree.TreeNode, Double> centers,
+                                          Set<PlanTree.TreeNode> placed) {
+        // 共享节点（如催化剂 DAG）只布局一次：后续引用直接沿用已有中心，避免覆盖导致 dangling edge。
+        if (!placed.add(node)) {
+            return ICON_SIZE;
+        }
         if (node.children() == null || node.children().isEmpty()) {
             double center = leftBoundary + ICON_SIZE / 2.0;
             centers.put(node, center);
@@ -285,7 +537,7 @@ public final class PlanPreviewScreen extends Screen {
         double firstCenter = -1;
         double lastCenter = -1;
         for (PlanTree.TreeNode child : node.children()) {
-            double childWidth = layoutPositions(child, cur, centers);
+            double childWidth = layoutPositions(child, cur, centers, placed);
             double childCenter = centers.get(child);
             if (firstCenter < 0) {
                 firstCenter = childCenter;
@@ -297,6 +549,30 @@ public final class PlanPreviewScreen extends Screen {
         double center = (firstCenter + lastCenter) / 2.0;
         centers.put(node, center);
         return Math.max(ICON_SIZE, totalWidth);
+    }
+
+    /** 树布局结果缓存：层、中心 x、每层 y、树总宽/底部。布局只依赖树结构，不依赖视口。 */
+    private static final class TreeLayout {
+        final List<List<PlanTree.TreeNode>> levels;
+        final Map<PlanTree.TreeNode, Double> centers;
+        final Map<PlanTree.TreeNode, Integer> ys;
+        final double treeWidth;
+        final int treeBottom;
+
+        TreeLayout(PlanTree.TreeNode root) {
+            levels = collectLevels(root);
+            centers = new HashMap<>();
+            Set<PlanTree.TreeNode> placed = Collections.newSetFromMap(new IdentityHashMap<>());
+            treeWidth = layoutPositions(root, 0.0, centers, placed);
+            ys = new HashMap<>();
+            for (int i = 0; i < levels.size(); i++) {
+                int y = CONTENT_TOP + i * V_GAP;
+                for (PlanTree.TreeNode n : levels.get(i)) {
+                    ys.put(n, y);
+                }
+            }
+            treeBottom = CONTENT_TOP + levels.size() * V_GAP;
+        }
     }
 
     /** 画一个节点的 T 型连接线：父底部 → 子顶部的三段（竖线 + 横线 + 竖线）。 */
@@ -326,31 +602,81 @@ public final class PlanPreviewScreen extends Screen {
         g.fill(firstCx - half, midY - half, lastCx + half + 2, midY + half + 1, LINE_COLOR);
     }
 
-    /** 画一个节点：物品图标 + 数量标注。 */
+    /** 画一个节点：物品图标 + 数量标注；多配方节点额外画 +/- 提示可点击展开。 */
     private void drawNode(GuiGraphics g, PlanTree.TreeNode node, int centerX, int y) {
         int itemX = centerX - ICON_SIZE / 2;
+        String methodId = processingMethodId(node);
+        boolean manual = methodId != null && !ManualProcessing.isAutoCraftable(methodId);
+        if (manual) {
+            // 红色圆角边框：提示此物品需要手动加工
+            int c = 0xFFFF5555;
+            g.fill(itemX - 2, y - 2, itemX + ICON_SIZE + 2, y - 1, c);
+            g.fill(itemX - 2, y + ICON_SIZE + 1, itemX + ICON_SIZE + 2, y + ICON_SIZE + 2, c);
+            g.fill(itemX - 2, y - 2, itemX - 1, y + ICON_SIZE + 2, c);
+            g.fill(itemX + ICON_SIZE + 1, y - 2, itemX + ICON_SIZE + 2, y + ICON_SIZE + 2, c);
+            String iconItemId = ProcessingIconProvider.getIconItemId(methodId, node.material().itemId());
+            if (iconItemId != null) {
+                drawItemIcon(g, iconItemId, itemX - 12, y - 2);
+            }
+        }
         drawItemIcon(g, node.material().itemId(), itemX, y);
         g.drawString(font, "×" + node.amount(), itemX + ICON_SIZE - 2, y + ICON_SIZE - 8,
                 stateTextColor(node.state()));
+        if (graph.recipesFor(node.material()).size() > 1) {
+            String mark = expandedMaterials.contains(node.material().itemId()) ? "-" : "+";
+            g.drawString(font, mark, itemX + ICON_SIZE - 6, y, 0xFFFFAA);
+        }
     }
 
-    private void renderTotalsRow(GuiGraphics g, int y, int maxY) {
-        g.drawString(font, "总耗材", 0, y, TITLE_COLOR);
-        g.drawString(font, "(聚合)", font.width("总耗材") + 4, y, SUBTLE_COLOR);
-        int ty = y + ICON_SIZE + 4;
-        if (ty + ICON_SIZE > maxY) {
+    /** 获取节点加工方式：优先配方自带方式；无配方的叶子查手动等价表。 */
+    private String processingMethodId(PlanTree.TreeNode node) {
+        if (node.recipeId() != null) {
+            RecipeNode rn = graph.recipeById(node.recipeId());
+            if (rn != null) {
+                return rn.method();
+            }
+        }
+        ManualProcessing.ManualMethod mm = ManualProcessing.methodForItem(node.material().itemId());
+        return mm != null ? mm.id() : null;
+    }
+
+    /** 固定右侧总耗材面板：标题固定，列表可滚轮滚动，缺失红/满足绿。 */
+    private void renderTotalsPanel(GuiGraphics g, int mouseX, int mouseY) {
+        if (totals.isEmpty()) {
             return;
         }
-        int tx = 0;
+        int x = totalsX();
+        int y = totalsY();
+        int panelH = totalsHeight();
+        g.fill(x - 4, y - 4, x + TOTALS_REGION_WIDTH + 4, y + panelH + 4, 0xAA000000);
+        g.drawString(font, "总耗材(聚合)", x, y, TITLE_COLOR);
+        int headerH = 20;
+        double itemYAcc = y + headerH - totalsScrollY;
         for (Map.Entry<MaterialRef, Long> e : totals.entrySet()) {
-            drawItemIcon(g, e.getKey().itemId(), tx, ty);
-            g.drawString(font, "×" + e.getValue(), tx + ICON_SIZE - 2, ty + ICON_SIZE - 8,
-                    SUBTLE_COLOR);
-            // hover 检测（布局坐标 → 屏幕坐标）
-            if (hoveredTotal == null && hitRect(tx, ty, ICON_SIZE, ICON_SIZE, mouseXCache, mouseYCache)) {
+            int rowH = totalsRowHeight(e);
+            int iy = (int) Math.round(itemYAcc);
+            itemYAcc += rowH;
+            if (iy + ICON_SIZE < y || iy > y + panelH) {
+                continue;
+            }
+            int ix = x + 4;
+            drawItemIcon(g, e.getKey().itemId(), ix, iy);
+            long have = stock.getOrDefault(e.getKey(), 0);
+            int color = have >= e.getValue() ? 0x55FF55 : 0xFF5555;
+            g.drawString(font, "×" + e.getValue(), ix + ICON_SIZE - 2, iy + ICON_SIZE - 8, color);
+            List<ManualProcessing.DropEquivalent> eqs = ManualProcessing.equivalences(e.getKey().itemId());
+            if (!eqs.isEmpty()) {
+                ManualProcessing.DropEquivalent eq = eqs.get(0);
+                long altAmount = e.getValue() * eq.perUnit();
+                int altY = iy + ICON_SIZE + 1;
+                g.drawString(font, "或", ix + 2, altY + 4, 0xAAAAAA);
+                drawItemIcon(g, eq.alternativeItemId(), ix + 16, altY);
+                g.drawString(font, "×" + altAmount, ix + 34, altY + 8, 0xAAAAAA);
+            }
+            if (hoveredTotal == null && mouseX >= ix - 2 && mouseX <= ix + ICON_SIZE + 2
+                    && mouseY >= iy - 2 && mouseY <= iy + ICON_SIZE + 2) {
                 hoveredTotal = e;
             }
-            tx += ICON_SIZE + H_GAP;
         }
     }
 
@@ -360,22 +686,21 @@ public final class PlanPreviewScreen extends Screen {
         String displayName = displayNameOf(entry.getKey());
         lines.add(Component.literal(displayName + " ×" + entry.getValue() + "（总耗材）")
                 .withStyle(ChatFormatting.WHITE));
+        if (!entry.getKey().nbt().isEmpty()) {
+            lines.add(Component.literal("要求: " + NbtDisplay.localize(entry.getKey().nbt()))
+                    .withStyle(ChatFormatting.GRAY));
+        }
+        for (ManualProcessing.DropEquivalent eq : ManualProcessing.equivalences(entry.getKey().itemId())) {
+            ManualProcessing.ManualMethod mm = ManualProcessing.method(eq.methodId());
+            String methodName = mm != null ? mm.displayName() : eq.methodId();
+            long altAmount = entry.getValue() * eq.perUnit();
+            lines.add(Component.literal("或 " + altAmount + "× " + displayNameOf(MaterialRef.of(eq.alternativeItemId()))
+                    + "（" + methodName + "，需手动获取，AutoCraft 不自动执行）")
+                    .withStyle(ChatFormatting.GRAY));
+        }
         lines.add(Component.literal("注册名: " + entry.getKey().itemId())
                 .withStyle(ChatFormatting.DARK_GRAY));
         g.renderTooltip(font, lines, Optional.empty(), mouseX, mouseY);
-    }
-
-    /** 缓存鼠标坐标，避免 renderTotalsRow 调用 hitTest 时再传参数。 */
-    private int mouseXCache, mouseYCache;
-
-    /** 矩形命中检测（布局坐标 → 屏幕坐标 + 命中区）。 */
-    private boolean hitRect(int lx, int ly, int w, int h, double mouseX, double mouseY) {
-        double sx = lx * zoom + panX;
-        double sy = ly * zoom + panY;
-        double sw = w * zoom;
-        double sh = h * zoom;
-        return mouseX >= sx - 2 && mouseX <= sx + sw + 2
-                && mouseY >= sy - 2 && mouseY <= sy + sh + 2;
     }
 
     /** 悬停 tooltip：物品显示名 + 数量 + 状态 + 配方短名。 */
@@ -385,11 +710,29 @@ public final class PlanPreviewScreen extends Screen {
         String suffix = node.state() == PlanTree.State.HAS ? "（库存满足）"
                 : node.state() == PlanTree.State.PARTIAL ? "（部分满足）"
                 : node.state() == PlanTree.State.MISSING ? "（缺失）" : "（需生产）";
-        lines.add(Component.literal(displayName + " ×" + node.amount() + " " + suffix)
-                .withStyle(ChatFormatting.WHITE));
+        String amountText = node.catalyst()
+                ? displayName + " ×" + node.amount() + "（催化剂，持有不消耗）"
+                : displayName + " ×" + node.amount() + " " + suffix;
+        lines.add(Component.literal(amountText).withStyle(ChatFormatting.WHITE));
+        if (!node.requirementText().isEmpty()) {
+            lines.add(Component.literal("要求: " + NbtDisplay.localize(node.requirementText()))
+                    .withStyle(ChatFormatting.GRAY));
+        }
         if (node.recipeId() != null) {
             lines.add(Component.literal("配方: " + shortRecipe(node.recipeId()))
                     .withStyle(ChatFormatting.GRAY));
+        }
+        String methodId = processingMethodId(node);
+        if (methodId != null && !ManualProcessing.isAutoCraftable(methodId)) {
+            ManualProcessing.ManualMethod mm = ManualProcessing.method(methodId);
+            String methodName = mm != null ? mm.displayName() : methodId;
+            lines.add(Component.literal("此物品需要通过 " + methodName + " 手动加工，AutoCraft 不会自动执行")
+                    .withStyle(ChatFormatting.RED));
+        }
+        if (graph.recipesFor(node.material()).size() > 1) {
+            boolean expanded = expandedMaterials.contains(node.material().itemId());
+            lines.add(Component.literal(expanded ? "左键点击收起其他配方" : "左键点击展开其他配方")
+                    .withStyle(ChatFormatting.YELLOW));
         }
         lines.add(Component.literal("注册名: " + node.material().itemId())
                 .withStyle(ChatFormatting.DARK_GRAY));
@@ -411,9 +754,19 @@ public final class PlanPreviewScreen extends Screen {
     // 工具
     // ------------------------------------------------------------------
 
+    /** 带缓存的物品解析：树渲染每帧多次调用，避免每节点每帧查注册表。 */
+    private Item resolveItem(String itemId) {
+        if (itemCache.containsKey(itemId)) {
+            return itemCache.get(itemId);
+        }
+        Item item = ForgeRegistries.ITEMS.getValue(ResourceLocation.tryParse(itemId));
+        itemCache.put(itemId, item);
+        return item;
+    }
+
     private void drawItemIcon(GuiGraphics g, String itemId, int x, int y) {
         try {
-            Item item = ForgeRegistries.ITEMS.getValue(ResourceLocation.tryParse(itemId));
+            Item item = resolveItem(itemId);
             if (item == null || item == net.minecraft.world.item.Items.AIR) {
                 return;
             }
@@ -423,10 +776,10 @@ public final class PlanPreviewScreen extends Screen {
         }
     }
 
-    /** 物品显示名（本地化）。失败时回退注册名短名。 */
-    private static String displayNameOf(MaterialRef material) {
+    /** 物品显示名（本地化）。失败时回退注册名。 */
+    private String displayNameOf(MaterialRef material) {
         try {
-            Item item = ForgeRegistries.ITEMS.getValue(ResourceLocation.tryParse(material.itemId()));
+            Item item = resolveItem(material.itemId());
             if (item == null) {
                 return material.itemId();
             }
@@ -455,24 +808,30 @@ public final class PlanPreviewScreen extends Screen {
     }
 
     private void setQuantity(int q) {
-        quantity = q;
-        Log.debug("预览数量切换为 " + q);
+        quantity = Math.max(1, q);
+        if (quantityInput != null) {
+            quantityInput.setValue(String.valueOf(quantity));
+        }
+        Log.debug("预览数量切换为 " + quantity);
         result = OrderTrigger.plan(target, quantity);
         if (result == null) {
             error = "规划失败";
             root = null;
             totals = Map.of();
+            layout = null;
             viewInitialized = false;
+            totalsScrollY = 0;
             return;
         }
-        root = OrderTrigger.buildTree(target, quantity, result);
-        totals = root == null ? Map.of() : PlanTree.totalLeafDemand(root);
-        viewInitialized = false;   // 树变了，重新居中
-        if (!result.feasible()) {
-            error = "数量 " + quantity + " 时不可行：" + OrderTrigger.failureSummary(result);
-        } else {
-            error = null;
+        // 材料不足也保留预览：不设置 error，树/总耗材以红色展示缺失。
+        error = null;
+        chosenRecipes.clear();
+        if (result.feasible()) {
+            for (PureSearchPlanner.PlannedStep step : result.steps()) {
+                chosenRecipes.add(step.recipeId());
+            }
         }
+        rebuildTree();   // 用当前展开集合重建树并重新居中
     }
 
     private void confirm() {

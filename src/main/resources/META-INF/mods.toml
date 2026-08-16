@@ -1,6 +1,8 @@
 modLoader="javafml"
 loaderVersion="[47,)"
 license="BSD-2-Clause"
+[[mixins]]
+config="autocraft.mixins.json"
 [[mods]]
 modId="autocraft"
 version="1.1.0"
