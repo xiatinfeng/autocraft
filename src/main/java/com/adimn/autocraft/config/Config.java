@@ -24,6 +24,7 @@ public final class Config {
     public static ForgeConfigSpec.BooleanValue LOG_DEBUG;
     public static ForgeConfigSpec.BooleanValue CRAFT_EXTRA_COUNT;
     public static ForgeConfigSpec.BooleanValue FIXED_NODE_SIZE;
+    public static ForgeConfigSpec.BooleanValue AUTO_FIT_TREE;
 
     /** 局内指令的运行时覆盖（会话级，重启或 /autocraft config 清空后失效）。 */
     private static volatile Integer delayOverride;
@@ -32,6 +33,7 @@ public final class Config {
     private static volatile Boolean crossLayerOverride;
     private static volatile Boolean extraCountOverride;
     private static volatile Boolean fixedNodeSizeOverride;
+    private static volatile Boolean autoFitTreeOverride;
 
     private static final ForgeConfigSpec.Builder BUILDER = new ForgeConfigSpec.Builder();
     private static final ForgeConfigSpec SPEC;
@@ -66,6 +68,8 @@ public final class Config {
                 .define("craftExtraCount", true);
         FIXED_NODE_SIZE = BUILDER.comment("预览树节点固定屏幕大小（不随缩放变化）。默认 false。")
                 .define("fixedNodeSize", false);
+        AUTO_FIT_TREE = BUILDER.comment("打开预览时自动缩放整棵树到可视区。默认 false。")
+                .define("autoFitTree", false);
         SPEC = BUILDER.build();
     }
 
@@ -124,6 +128,11 @@ public final class Config {
         fixedNodeSizeOverride = on;
     }
 
+    /** /autocraft autofit <on|off>：会话级覆盖预览树自动缩放开关。 */
+    public static void setAutoFitTreeOverride(boolean on) {
+        autoFitTreeOverride = on;
+    }
+
     /** 清空所有运行时覆盖。 */
     public static void clearOverrides() {
         delayOverride = null;
@@ -132,6 +141,7 @@ public final class Config {
         crossLayerOverride = null;
         extraCountOverride = null;
         fixedNodeSizeOverride = null;
+        autoFitTreeOverride = null;
     }
 
     public static int maxSteps() {
@@ -161,6 +171,12 @@ public final class Config {
     public static boolean fixedNodeSize() {
         Boolean override = fixedNodeSizeOverride;
         return override != null ? override : FIXED_NODE_SIZE.get();
+    }
+
+    /** 预览树自动缩放开关（默认 false）。 */
+    public static boolean autoFitTree() {
+        Boolean override = autoFitTreeOverride;
+        return override != null ? override : AUTO_FIT_TREE.get();
     }
 
     public static java.util.Set<String> blacklistItems() {

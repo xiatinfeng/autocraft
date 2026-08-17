@@ -67,7 +67,7 @@ public final class PlanPreviewScreen extends Screen {
     private static final int TOTALS_REGION_WIDTH = 80;
     private static final int TOTALS_MARGIN = 8;
     private static final int TOTALS_ITEM_GAP = 6;
-    private static final double MIN_ZOOM = 0.6;
+    private static final double MIN_ZOOM = 0.15;
     private static final double MAX_ZOOM = 3.0;
     private static final double ZOOM_STEP = 1.1;
 
@@ -94,6 +94,10 @@ public final class PlanPreviewScreen extends Screen {
     private boolean viewInitialized;
     private PlanTree.TreeNode hoveredNode;   // 当前悬停节点（tooltip）
     private Map.Entry<MaterialRef, Long> hoveredTotal;   // 当前悬停的总耗材（tooltip）
+    private boolean danglingProbeLogged;     // 深探针：每个预览界面只记录第一次异常
+    private int renderSkipLogged;            // 渲染跳过探针计数
+    private int unknownItemLogged;           // 未知物品探针计数
+    private int connectorSkipLogged;         // 连线跳过探针计数
 
     /** 树布局缓存：只在树结构变化（首次打开 / 数量切换）时重建，渲染期只读。 */
     private TreeLayout layout;
@@ -172,7 +176,8 @@ public final class PlanPreviewScreen extends Screen {
             g.drawCenteredString(font, "当前数量 " + quantity + " 不可行，红色 = 缺失材料", width / 2, 58, 0xFF5555);
         }
         if (root != null) {
-            renderLayeredTree(g, root, maxY, mouseX, mouseY);
+            // 树使用屏幕实际高度作为裁剪边界，避免在按钮预留线处出现“虚空引用”。
+            renderLayeredTree(g, root, height, mouseX, mouseY);
         } else if (result != null) {
             renderFlatFallback(g, maxY);
         }
@@ -371,7 +376,6 @@ public final class PlanPreviewScreen extends Screen {
         if (layout == null) {
             return;
         }
-        List<List<PlanTree.TreeNode>> levels = layout.levels;
         Map<PlanTree.TreeNode, Double> centers = layout.centers;
         Map<PlanTree.TreeNode, Integer> ys = layout.ys;
 
@@ -383,7 +387,7 @@ public final class PlanPreviewScreen extends Screen {
 
         // 画连接线（在节点之前，避免覆盖图标）；连接线随缩放走
         for (PlanTree.TreeNode n : centers.keySet()) {
-            drawConnections(g, n, centers, ys);
+            drawConnections(g, n, centers, ys, maxY);
         }
 
         boolean fixedNodes = Config.fixedNodeSize();
@@ -392,10 +396,8 @@ public final class PlanPreviewScreen extends Screen {
             int y = ys.get(n);
             int sx = (int) Math.round(cx * zoom + panX);
             int sy = (int) Math.round(y * zoom + panY);
-            int nodeScreenSize = (int) Math.ceil(ICON_SIZE * (fixedNodes ? 1.0 : zoom));
-            if (sy + nodeScreenSize < 0 || sy > maxY) {
-                continue;
-            }
+            // 不再按 maxY 过滤：所有节点都画，超出屏幕由 GuiGraphics 自行裁剪，
+            // 避免人为跳过节点导致“虚空引用/树枝间断”。
             if (!fixedNodes) {
                 // 默认：节点跟随缩放一起变换（原版手感）
                 drawNode(g, n, cx, y);
@@ -458,13 +460,30 @@ public final class PlanPreviewScreen extends Screen {
         return ICON_SIZE + TOTALS_ITEM_GAP + (hasEq ? 8 : 0);
     }
 
-    /** 首次渲染时把树居中于左侧视图区（视口初始化一次）。 */
+    /** 首次渲染时把树居中于左侧视图区；大树/超宽树自动缩放适配，小树保持默认。 */
     private void ensureView() {
         if (viewInitialized || layout == null) {
             return;
         }
-        panX = (treeViewWidth() - layout.treeWidth) / 2.0;
-        panY = 40.0;
+        int viewW = treeViewWidth();
+        int maxY = height - BOTTOM_BUTTON_RESERVE;
+        int availH = Math.max(40, maxY - CONTENT_TOP);
+        boolean needsFit = Config.autoFitTree()
+                || layout.treeWidth > viewW
+                || layout.treeBottom > maxY;
+        if (needsFit) {
+            double fitZoom = Math.min(
+                    viewW / Math.max(1.0, layout.treeWidth),
+                    availH / Math.max(1.0, layout.treeBottom)
+            );
+            zoom = clamp(fitZoom, MIN_ZOOM, 1.0);
+            panX = (viewW - layout.treeWidth * zoom) / 2.0;
+            panY = CONTENT_TOP + (availH - layout.treeBottom * zoom) / 2.0;
+        } else {
+            zoom = 1.0;
+            panX = (viewW - layout.treeWidth) / 2.0;
+            panY = 40.0;
+        }
         viewInitialized = true;
     }
 
@@ -551,54 +570,139 @@ public final class PlanPreviewScreen extends Screen {
         return Math.max(ICON_SIZE, totalWidth);
     }
 
-    /** 树布局结果缓存：层、中心 x、每层 y、树总宽/底部。布局只依赖树结构，不依赖视口。 */
+    /** 树布局结果缓存：RSI 风格 Box 列表 + centers/ys 兼容现有渲染。 */
     private static final class TreeLayout {
-        final List<List<PlanTree.TreeNode>> levels;
-        final Map<PlanTree.TreeNode, Double> centers;
-        final Map<PlanTree.TreeNode, Integer> ys;
+        /** 一个已布局节点：逻辑坐标，屏幕变换在渲染时应用。 */
+        record Box(PlanTree.TreeNode node, int x, int y, int w, int h, int itemCenterX) {
+            int centerX() { return x + w / 2; }
+            int bottom() { return y + h; }
+        }
+
+        final List<Box> boxes = new ArrayList<>();
+        final Map<PlanTree.TreeNode, Double> centers = new HashMap<>();
+        final Map<PlanTree.TreeNode, Integer> ys = new HashMap<>();
         final double treeWidth;
         final int treeBottom;
 
         TreeLayout(PlanTree.TreeNode root) {
-            levels = collectLevels(root);
-            centers = new HashMap<>();
-            Set<PlanTree.TreeNode> placed = Collections.newSetFromMap(new IdentityHashMap<>());
-            treeWidth = layoutPositions(root, 0.0, centers, placed);
-            ys = new HashMap<>();
-            for (int i = 0; i < levels.size(); i++) {
-                int y = CONTENT_TOP + i * V_GAP;
-                for (PlanTree.TreeNode n : levels.get(i)) {
-                    ys.put(n, y);
-                }
+            IdentityHashMap<PlanTree.TreeNode, Integer> measureCache = new IdentityHashMap<>();
+            int rootWidth = measure(root, measureCache);
+            layout(root, 0, CONTENT_TOP, rootWidth, measureCache);
+            treeWidth = rootWidth;
+            int maxBottom = 0;
+            for (Box box : boxes) {
+                centers.put(box.node(), (double) box.itemCenterX());
+                ys.put(box.node(), box.y());
+                maxBottom = Math.max(maxBottom, box.bottom());
             }
-            treeBottom = CONTENT_TOP + levels.size() * V_GAP;
+            treeBottom = maxBottom;
+            Log.info("TREE LAYOUT PROBE: boxes=" + boxes.size()
+                    + " centers=" + centers.size()
+                    + " ys=" + ys.size()
+                    + " width=" + treeWidth
+                    + " bottom=" + treeBottom);
+        }
+
+        private static int nodeWidth() {
+            return ICON_SIZE;
+        }
+
+        private int measure(PlanTree.TreeNode node,
+                            IdentityHashMap<PlanTree.TreeNode, Integer> cache) {
+            Integer cached = cache.get(node);
+            if (cached != null) return cached;
+            int result;
+            if (node.children() == null || node.children().isEmpty()) {
+                result = nodeWidth();
+            } else {
+                result = Math.max(nodeWidth(), childrenWidth(node.children(), cache));
+            }
+            cache.put(node, result);
+            return result;
+        }
+
+        private int childrenWidth(List<PlanTree.TreeNode> children,
+                                  IdentityHashMap<PlanTree.TreeNode, Integer> cache) {
+            int width = 0;
+            for (int i = 0; i < children.size(); i++) {
+                if (i > 0) width += H_GAP;
+                width += measure(children.get(i), cache);
+            }
+            return width;
+        }
+
+        private void layout(PlanTree.TreeNode node, int left, int y, int subtreeWidth,
+                            IdentityHashMap<PlanTree.TreeNode, Integer> cache) {
+            int nodeW = nodeWidth();
+            int x = left + (subtreeWidth - nodeW) / 2;
+            boxes.add(new Box(node, x, y, nodeW, ICON_SIZE, x + nodeW / 2));
+            if (node.children() == null || node.children().isEmpty()) return;
+
+            int childLeft = left + (subtreeWidth - childrenWidth(node.children(), cache)) / 2;
+            int childY = y + V_GAP;
+            for (PlanTree.TreeNode child : node.children()) {
+                int childWidth = measure(child, cache);
+                layout(child, childLeft, childY, childWidth, cache);
+                childLeft += childWidth + H_GAP;
+            }
+        }
+
+        Box boxFor(PlanTree.TreeNode node) {
+            for (Box box : boxes) {
+                if (box.node() == node) return box;
+            }
+            return null;
         }
     }
 
     /** 画一个节点的 T 型连接线：父底部 → 子顶部的三段（竖线 + 横线 + 竖线）。 */
     private void drawConnections(GuiGraphics g, PlanTree.TreeNode node,
                                   Map<PlanTree.TreeNode, Double> centers,
-                                  Map<PlanTree.TreeNode, Integer> ys) {
+                                  Map<PlanTree.TreeNode, Integer> ys, int maxY) {
         if (node.children() == null || node.children().isEmpty()) {
             return;
         }
-        int parentCx = (int) Math.round(centers.get(node));
-        int parentBottom = ys.get(node) + ICON_SIZE;
-        PlanTree.TreeNode firstChild = node.children().get(0);
+        Double parentCxObj = centers.get(node);
+        Integer parentBottomObj = ys.get(node);
+        if (parentCxObj == null || parentBottomObj == null) {
+            return;
+        }
+        int parentCx = (int) Math.round(parentCxObj);
+        int parentBottom = parentBottomObj + ICON_SIZE;
+
+        // 连接所有“确实有布局位置”的子节点；不再按屏幕可见性过滤，交给屏幕裁剪。
+        List<PlanTree.TreeNode> placedChildren = new ArrayList<>();
+        for (PlanTree.TreeNode child : node.children()) {
+            if (!centers.containsKey(child) || !ys.containsKey(child)) {
+                // 缺失布局位置是真正的结构异常，每次都记录
+                Log.info("DANGLING PROBE: parent=" + node.material()
+                        + " child=" + child.material()
+                        + " missing centers=" + centers.containsKey(child)
+                        + " ys=" + ys.containsKey(child)
+                        + " parentChildren=" + node.children().size());
+                continue;
+            }
+            placedChildren.add(child);
+        }
+        if (placedChildren.isEmpty()) {
+            return;
+        }
+
+        PlanTree.TreeNode firstChild = placedChildren.get(0);
         int childTop = ys.get(firstChild);
         int midY = (parentBottom + childTop) / 2;
         int half = LINE_WIDTH / 2;
 
         // 父竖线（LINE_WIDTH 居中在 parentCx）
         g.fill(parentCx - half, parentBottom, parentCx + half + 1, midY + 1, LINE_COLOR);
-        // 子顶部竖线（每个子一条）
-        for (PlanTree.TreeNode child : node.children()) {
+        // 子顶部竖线（每个可见子节点一条）
+        for (PlanTree.TreeNode child : placedChildren) {
             int cx = (int) Math.round(centers.get(child));
-            g.fill(cx - half, midY, cx + half + 1, childTop, LINE_COLOR);
+            g.fill(cx - half, midY, cx + half + 1, ys.get(child), LINE_COLOR);
         }
-        // 横线（连接第一个子到最后一个子，LINE_WIDTH 厚）
+        // 横线（连接第一个可见子到最后一个可见子，LINE_WIDTH 厚）
         int firstCx = (int) Math.round(centers.get(firstChild));
-        int lastCx = (int) Math.round(centers.get(node.children().get(node.children().size() - 1)));
+        int lastCx = (int) Math.round(centers.get(placedChildren.get(placedChildren.size() - 1)));
         g.fill(firstCx - half, midY - half, lastCx + half + 2, midY + half + 1, LINE_COLOR);
     }
 
@@ -614,7 +718,7 @@ public final class PlanPreviewScreen extends Screen {
             g.fill(itemX - 2, y + ICON_SIZE + 1, itemX + ICON_SIZE + 2, y + ICON_SIZE + 2, c);
             g.fill(itemX - 2, y - 2, itemX - 1, y + ICON_SIZE + 2, c);
             g.fill(itemX + ICON_SIZE + 1, y - 2, itemX + ICON_SIZE + 2, y + ICON_SIZE + 2, c);
-            String iconItemId = ProcessingIconProvider.getIconItemId(methodId, node.material().itemId());
+            String iconItemId = ProcessingIconProvider.getIconItemId(methodId, node.material().itemId(), node.recipeId());
             if (iconItemId != null) {
                 drawItemIcon(g, iconItemId, itemX - 12, y - 2);
             }
@@ -768,6 +872,10 @@ public final class PlanPreviewScreen extends Screen {
         try {
             Item item = resolveItem(itemId);
             if (item == null || item == net.minecraft.world.item.Items.AIR) {
+                if (unknownItemLogged < 20) {
+                    Log.info("UNKNOWN ITEM PROBE: " + itemId);
+                    unknownItemLogged++;
+                }
                 return;
             }
             g.renderItem(new ItemStack(item), x, y);

@@ -21,6 +21,7 @@ _rsref-github/
 _classparse.py
 _strings.py
 _emistrings.txt
+patch_layout*.py
 
 # 散落的旧 jar（构建依赖在 libs/）
 *.jar

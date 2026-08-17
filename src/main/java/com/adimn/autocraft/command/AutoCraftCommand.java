@@ -71,6 +71,9 @@ public final class AutoCraftCommand {
                 .then(Commands.literal("fixnodes")
                         .then(Commands.argument("on", BoolArgumentType.bool())
                                 .executes(AutoCraftCommand::fixedNodes)))
+                .then(Commands.literal("autofit")
+                        .then(Commands.argument("on", BoolArgumentType.bool())
+                                .executes(AutoCraftCommand::autoFit)))
                 .then(Commands.literal("stop")
                         .executes(AutoCraftCommand::stop)));
     }
@@ -137,6 +140,15 @@ public final class AutoCraftCommand {
         boolean on = BoolArgumentType.getBool(ctx, "on");
         Config.setFixedNodeSizeOverride(on);
         ctx.getSource().sendSuccess(() -> Component.literal("预览树节点固定大小已"
+                + (on ? "开启" : "关闭") + "（默认关闭；会话级，重启失效）。"), false);
+        return 1;
+    }
+
+    /** /autocraft autofit <on|off>：会话级覆盖预览树自动缩放开关。 */
+    private static int autoFit(CommandContext<CommandSourceStack> ctx) {
+        boolean on = BoolArgumentType.getBool(ctx, "on");
+        Config.setAutoFitTreeOverride(on);
+        ctx.getSource().sendSuccess(() -> Component.literal("预览树自动缩放已"
                 + (on ? "开启" : "关闭") + "（默认关闭；会话级，重启失效）。"), false);
         return 1;
     }

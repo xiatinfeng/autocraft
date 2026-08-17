@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 import com.adimn.autocraft.util.Log;
 
@@ -28,31 +29,43 @@ public final class ProcessingIconProvider {
     private ProcessingIconProvider() {
     }
 
-    /** 根据加工方式和输出物品返回一个可用作图标的物品 id；找不到返回 null。 */
-    public static String getIconItemId(String methodId, String outputItemId) {
+    /** 根据加工方式、输出物品和实际配方 id 返回可用作图标的物品 id；找不到返回 null。 */
+    public static String getIconItemId(String methodId, String outputItemId, String recipeId) {
         if (methodId == null || methodId.isBlank()) {
             return null;
         }
-        String cacheKey = methodId + "|" + outputItemId;
+        String cacheKey = methodId + "|" + outputItemId + "|" + (recipeId == null ? "" : recipeId);
         String cached = CACHE.get(cacheKey);
         if (cached != null) {
             return cached.isEmpty() ? null : cached;
         }
-        String result = resolve(methodId, outputItemId);
+        String result = resolve(methodId, outputItemId, recipeId);
         CACHE.put(cacheKey, result == null ? "" : result);
         return result;
     }
 
-    private static String resolve(String methodId, String outputItemId) {
+    private static String resolve(String methodId, String outputItemId, String recipeId) {
         // 1. 内置原版加工方式图标
         ManualProcessing.ManualMethod builtin = ManualProcessing.method(methodId);
         if (builtin != null && builtin.iconItemId() != null) {
             Log.info("ProcessingIconProvider: builtin icon for " + methodId + " -> " + builtin.iconItemId());
             return builtin.iconItemId();
         }
-        // 2. 不再用“产物本身”当加工图标：会导致沙子显示成“用沙子加工沙子”的误导。
-        //    直接进入 EMI/JEI 动态查询工作方块。
-        // 3. EMI 动态查询工作方块
+        // 2. 优先按实际配方 id 查它自己的加工类别/工作方块，避免“扫到别的 mod 工作台”。
+        if (recipeId != null && !recipeId.isBlank()) {
+            Log.info("ProcessingIconProvider: try recipe-specific icon for " + recipeId);
+            String emiRecipe = emiWorkstationForRecipe(recipeId);
+            if (emiRecipe != null) {
+                Log.info("ProcessingIconProvider: EMI recipe icon for " + recipeId + " -> " + emiRecipe);
+                return emiRecipe;
+            }
+            String jeiRecipe = jeiWorkstationForRecipe(recipeId);
+            if (jeiRecipe != null) {
+                Log.info("ProcessingIconProvider: JEI recipe icon for " + recipeId + " -> " + jeiRecipe);
+                return jeiRecipe;
+            }
+        }
+        // 3. 回退：按输出物品扫描（仍然优先非工作台工作方块）
         Log.info("ProcessingIconProvider: try EMI for " + methodId + " output=" + outputItemId);
         String emi = emiWorkstationForOutput(outputItemId);
         if (emi != null) {
@@ -66,6 +79,107 @@ public final class ProcessingIconProvider {
             return jei;
         }
         Log.info("ProcessingIconProvider: no JEI icon for " + outputItemId);
+        return null;
+    }
+
+    /** 通过 EMI 按配方 ID 精确查找工作方块。 */
+    private static String emiWorkstationForRecipe(String recipeId) {
+        try {
+            Class<?> emiApi = Class.forName("dev.emi.emi.api.EmiApi");
+            Method getRecipeManager = emiApi.getMethod("getRecipeManager");
+            Object manager = getRecipeManager.invoke(null);
+            if (manager == null) return null;
+
+            Class<?> managerClass = Class.forName("dev.emi.emi.api.recipe.EmiRecipeManager");
+            ResourceLocation id = ResourceLocation.tryParse(recipeId);
+            if (id == null) return null;
+
+            Method getRecipe;
+            try {
+                getRecipe = managerClass.getMethod("getRecipe", ResourceLocation.class);
+            } catch (NoSuchMethodException ignored) {
+                getRecipe = managerClass.getMethod("getRecipe", Class.forName("net.minecraft.util.Identifier"));
+            }
+            Object recipe = getRecipe.invoke(manager, id);
+            if (recipe == null) return null;
+
+            Class<?> recipeClass = Class.forName("dev.emi.emi.api.recipe.EmiRecipe");
+            Method getCategory = recipeClass.getMethod("getCategory");
+            Object category = getCategory.invoke(recipe);
+            Class<?> categoryClass = Class.forName("dev.emi.emi.api.recipe.EmiRecipeCategory");
+            Method getWorkstations = managerClass.getMethod("getWorkstations", categoryClass);
+            Object workstations = getWorkstations.invoke(manager, category);
+            if (!(workstations instanceof List<?> wsList)) return null;
+
+            for (Object workstation : wsList) {
+                Method getEmiStacks = workstation.getClass().getMethod("getEmiStacks");
+                Object stacks = getEmiStacks.invoke(workstation);
+                if (!(stacks instanceof List<?> stackList)) continue;
+                for (Object stack : stackList) {
+                    Method getItemStack = stack.getClass().getMethod("getItemStack");
+                    Object is = getItemStack.invoke(stack);
+                    if (is instanceof ItemStack itemStack && !itemStack.isEmpty()) {
+                        ResourceLocation key = ForgeRegistries.ITEMS.getKey(itemStack.getItem());
+                        if (key != null) return key.toString();
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.warn("ProcessingIconProvider: EMI recipe icon failed for " + recipeId + ": " + t);
+        }
+        return null;
+    }
+
+    /** 通过 JEI 按配方 ID 精确查找工作方块。 */
+    private static String jeiWorkstationForRecipe(String recipeId) {
+        try {
+            Class<?> internalClass = Class.forName("mezz.jei.common.Internal");
+            Method getOptional = internalClass.getMethod("getOptionalJeiRuntime");
+            Object opt = getOptional.invoke(null);
+            if (!(opt instanceof Optional<?> o) || o.isEmpty()) return null;
+            Object runtime = o.get();
+
+            Class<?> iJeiRuntimeClass = Class.forName("mezz.jei.api.runtime.IJeiRuntime");
+            Object recipeManager = iJeiRuntimeClass.getMethod("getRecipeManager").invoke(runtime);
+            Class<?> iRecipeManagerClass = Class.forName("mezz.jei.api.recipe.IRecipeManager");
+            Object lookup = iRecipeManagerClass.getMethod("createRecipeCategoryLookup").invoke(recipeManager);
+            Class<?> iRecipeCategoriesLookupClass = Class.forName("mezz.jei.api.recipe.IRecipeCategoriesLookup");
+            Object categoryStream = iRecipeCategoriesLookupClass.getMethod("get").invoke(lookup);
+
+            Class<?> iRecipeCategoryClass = Class.forName("mezz.jei.api.recipe.category.IRecipeCategory");
+            Method getRegistryName = iRecipeCategoryClass.getMethod("getRegistryName", Object.class);
+            Method getRecipeType = iRecipeCategoryClass.getMethod("getRecipeType");
+            Class<?> recipeTypeClass = Class.forName("mezz.jei.api.recipe.RecipeType");
+            Method createRecipeLookup = iRecipeManagerClass.getMethod("createRecipeLookup", recipeTypeClass);
+            Class<?> iRecipeLookupClass = Class.forName("mezz.jei.api.recipe.IRecipeLookup");
+            Method getRecipes = iRecipeLookupClass.getMethod("get");
+            Class<?> recipeTypeClass2 = recipeTypeClass;
+            Method createCatalystLookup = iRecipeManagerClass.getMethod("createRecipeCatalystLookup", recipeTypeClass2);
+            Class<?> iRecipeCatalystLookupClass = Class.forName("mezz.jei.api.recipe.IRecipeCatalystLookup");
+            Method getItemStack = iRecipeCatalystLookupClass.getMethod("getItemStack");
+
+            ResourceLocation target = ResourceLocation.tryParse(recipeId);
+            if (target == null) return null;
+
+            for (Object category : ((Stream<?>) categoryStream).toList()) {
+                Object recipeType = getRecipeType.invoke(category);
+                Object recipeLookup = createRecipeLookup.invoke(recipeManager, recipeType);
+                for (Object recipe : ((Stream<?>) getRecipes.invoke(recipeLookup)).toList()) {
+                    Object rid = getRegistryName.invoke(category, recipe);
+                    if (rid instanceof ResourceLocation r && r.equals(target)) {
+                        Object catalystLookup = createCatalystLookup.invoke(recipeManager, recipeType);
+                        for (Object stackObj : ((Stream<?>) getItemStack.invoke(catalystLookup)).toList()) {
+                            if (stackObj instanceof ItemStack is && !is.isEmpty()) {
+                                ResourceLocation key = ForgeRegistries.ITEMS.getKey(is.getItem());
+                                if (key != null) return key.toString();
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.warn("ProcessingIconProvider: JEI recipe icon failed for " + recipeId + ": " + t);
+        }
         return null;
     }
 
@@ -122,37 +236,47 @@ public final class ProcessingIconProvider {
                 return null;
             }
 
-            Object firstRecipe = list.get(0);
             Class<?> recipeClass = Class.forName("dev.emi.emi.api.recipe.EmiRecipe");
             Method getCategory = recipeClass.getMethod("getCategory");
-            Object category = getCategory.invoke(firstRecipe);
-            Log.info("ProcessingIconProvider: EMI category=" + category);
-
             Class<?> categoryClass = Class.forName("dev.emi.emi.api.recipe.EmiRecipeCategory");
             Method getWorkstations = managerClass.getMethod("getWorkstations", categoryClass);
-            Object workstations = getWorkstations.invoke(manager, category);
-            Log.info("ProcessingIconProvider: EMI workstations=" + workstations);
-            if (!(workstations instanceof List<?> wsList) || wsList.isEmpty()) {
-                return null;
-            }
 
-            for (Object workstation : wsList) {
-                Method getEmiStacks = workstation.getClass().getMethod("getEmiStacks");
-                Object stacks = getEmiStacks.invoke(workstation);
-                if (!(stacks instanceof List<?> stackList)) {
+            String fallback = null;
+            for (Object recipe : list) {
+                Object category = getCategory.invoke(recipe);
+                Object workstations = getWorkstations.invoke(manager, category);
+                if (!(workstations instanceof List<?> wsList)) {
                     continue;
                 }
-                for (Object stack : stackList) {
-                    Method getItemStack = stack.getClass().getMethod("getItemStack");
-                    Object is = getItemStack.invoke(stack);
-                    if (is instanceof ItemStack itemStack && !itemStack.isEmpty()) {
-                        ResourceLocation key = ForgeRegistries.ITEMS.getKey(itemStack.getItem());
-                        if (key != null) {
-                            Log.info("ProcessingIconProvider: found workstation icon " + key);
-                            return key.toString();
+                for (Object workstation : wsList) {
+                    Method getEmiStacks = workstation.getClass().getMethod("getEmiStacks");
+                    Object stacks = getEmiStacks.invoke(workstation);
+                    if (!(stacks instanceof List<?> stackList)) {
+                        continue;
+                    }
+                    for (Object stack : stackList) {
+                        Method getItemStack = stack.getClass().getMethod("getItemStack");
+                        Object is = getItemStack.invoke(stack);
+                        if (is instanceof ItemStack itemStack && !itemStack.isEmpty()) {
+                            ResourceLocation key = ForgeRegistries.ITEMS.getKey(itemStack.getItem());
+                            if (key == null) {
+                                continue;
+                            }
+                            if (fallback == null) {
+                                fallback = key.toString();
+                            }
+                            // 优先返回非工作台的加工方块（如魔力池、压印器），避免显示成“工作台合成”。
+                            if (!"minecraft:crafting_table".equals(key.toString())) {
+                                Log.info("ProcessingIconProvider: found workstation icon " + key);
+                                return key.toString();
+                            }
                         }
                     }
                 }
+            }
+            if (fallback != null) {
+                Log.info("ProcessingIconProvider: only crafting-table workstation found " + fallback);
+                return fallback;
             }
         } catch (Throwable t) {
             Log.warn("ProcessingIconProvider: EMI query failed for " + outputItemId + ": " + t);
@@ -210,33 +334,40 @@ public final class ProcessingIconProvider {
 
             Method getCategories = iRecipeCategoriesLookupClass.getMethod("get");
             Object categoryStream = getCategories.invoke(limited);
-            Method findFirstCategory = categoryStream.getClass().getMethod("findFirst");
-            Object optCategory = findFirstCategory.invoke(categoryStream);
-            if (!(optCategory instanceof Optional<?> oc) || oc.isEmpty()) {
+            List<?> categories = ((Stream<?>) categoryStream).toList();
+            if (categories.isEmpty()) {
                 Log.info("ProcessingIconProvider: JEI no category for " + outputItemId);
                 return null;
             }
-            Object category = oc.get();
 
             Class<?> iRecipeCategoryClass = Class.forName("mezz.jei.api.recipe.category.IRecipeCategory");
             Method getRecipeType = iRecipeCategoryClass.getMethod("getRecipeType");
-            Object recipeType = getRecipeType.invoke(category);
-
             Class<?> recipeTypeClass = Class.forName("mezz.jei.api.recipe.RecipeType");
             Method createCatalystLookup = iRecipeManagerClass.getMethod("createRecipeCatalystLookup", recipeTypeClass);
-            Object catalystLookup = createCatalystLookup.invoke(recipeManager, recipeType);
-
             Class<?> iRecipeCatalystLookupClass = Class.forName("mezz.jei.api.recipe.IRecipeCatalystLookup");
             Method getItemStack = iRecipeCatalystLookupClass.getMethod("getItemStack");
-            Object stackStream = getItemStack.invoke(catalystLookup);
-            Method findFirstStack = stackStream.getClass().getMethod("findFirst");
-            Object optStack = findFirstStack.invoke(stackStream);
-            if (optStack instanceof Optional<?> os && os.isPresent()
-                    && os.get() instanceof ItemStack is && !is.isEmpty()) {
-                ResourceLocation key = ForgeRegistries.ITEMS.getKey(is.getItem());
-                if (key != null) {
-                    return key.toString();
+
+            String fallback = null;
+            for (Object category : categories) {
+                Object recipeType = getRecipeType.invoke(category);
+                Object catalystLookup = createCatalystLookup.invoke(recipeManager, recipeType);
+                Object stackStream = getItemStack.invoke(catalystLookup);
+                for (Object stackObj : ((Stream<?>) stackStream).toList()) {
+                    if (stackObj instanceof ItemStack is && !is.isEmpty()) {
+                        ResourceLocation key = ForgeRegistries.ITEMS.getKey(is.getItem());
+                        if (key == null) continue;
+                        if (fallback == null) fallback = key.toString();
+                        // 优先非工作台工作方块（魔力池、压印器等）
+                        if (!"minecraft:crafting_table".equals(key.toString())) {
+                            Log.info("ProcessingIconProvider: JEI found workstation icon " + key);
+                            return key.toString();
+                        }
+                    }
                 }
+            }
+            if (fallback != null) {
+                Log.info("ProcessingIconProvider: JEI only crafting-table workstation found " + fallback);
+                return fallback;
             }
             Log.info("ProcessingIconProvider: JEI no catalyst ItemStack for " + outputItemId);
         } catch (Throwable t) {

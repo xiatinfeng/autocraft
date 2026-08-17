@@ -855,3 +855,27 @@ pathStack.remove(inputKey);   // 退出弹栈 —— 兄弟分支不受影响
 3. （可选）`totalLeafDemand` 对共享节点按 `graphNodeId` 合并计数（修贤者之石 ×N）。
 
 > 注意：rs_integration 是 Proprietary License —— 以上均为"思路借鉴后自行重写"，不复制其代码。
+
+
+---
+
+## 15. 2026-08-17 后续记录
+
+### 15.1 预览树虚空引用（dangling edge）——仍未解决
+
+- 已按 rs_integration `PlanTreeLayout` 重写为 `Box` + measure/layout。
+- 探针确认：`boxes/centers/ys` 数量一致，无缺失布局、无渲染跳过、无未知物品。
+- 用户反馈仍有“虚空引用/树枝间断”。
+- 结论：数据层面完整，疑似视觉坐标重叠/连线跨度问题，需截图或视觉调试才能继续。
+- 临时方案候选：异常时回退平面步骤列表；当前未启用。
+
+### 15.2 魔力钢锭配方显示错误（已修复）
+
+- 现象：`botania:manasteel_ingot` 在预览树中显示为工作台合成。
+- 实际来源：`botania:conversions/manasteel_block_deconstruct`（方块拆解）确实是工作台配方。
+- 根因：加工图标按“输出物品扫 JEI/EMI 第一个工作方块”，会拿到错误的工作台/精妙背包合成升级。
+- 修复：`ProcessingIconProvider` 改为**按树中实际选中的 `recipeId` 精确查加工类别/工作方块**：
+  - EMI：`EmiRecipeManager.getRecipe(recipeId)` → category → workstation；
+  - JEI：遍历 category，匹配 `registryName == recipeId` 的配方 → catalyst；
+  - 精确匹配失败时才回退到按输出物品扫描。
+- 结果：魔力钢锭现在显示 `botania:mana_pool`，不再误显示工作台或其他 mod 工作方块。
