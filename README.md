@@ -15,7 +15,7 @@
 ## 快速开始
 
 ```
-1. 丢 autocraft-1.1.0.jar 进 mods/
+1. 丢 autocraft-1.1.1.jar 进 mods/
 2. 放 16 个原木进背包，打开合成台
 3. 网格摆出木稿 → 按 B → 预览 → 开始合成
 ```
@@ -25,12 +25,12 @@
 ## 构建
 
 ```
-./gradlew build          # 产物 build/libs/autocraft-1.1.0.jar
+./gradlew build          # 产物 build/libs/autocraft-1.1.1.jar
 ```
 
 依赖：Forge 1.20.1-47.4.0 + `libs/` 内的 EMI 1.1.24 / JEI 15.20.0.129 jar（锁定版本，见 build.gradle）。
 
-## 已知问题（v1.1.0）
+## 已知问题（v1.1.1）
 
 - **配方树预览偶发"虚线/虚空引用"**：大树或含共享中间产物（如贤者之石类催化剂）时，树枝连线可能穿过空位或间断出现节点。**仅影响预览观感，不影响实际合成执行**。详见 DESIGN-v2.md §13。
 
