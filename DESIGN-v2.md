@@ -800,3 +800,58 @@ CraftExecutor：
 
 - 总耗材 80px 宽度下，“或”等价行可能显示拥挤，后续可改为 tooltip 或更紧凑布局。
 - JEI 官方额外按钮 API（15.38+）暂未使用，当前编译基线 JEI 15.20 不包含；后续升级基线后可替换 Mixin。
+
+## 14. 配方树实现思路对照：rs_integration（2026-08-17 调研）
+
+### 14.1 背景
+
+autocraft 预览树存在两个已知观感 bug（§13.1：虚空引用/dangling edge、共享中间产物数量错）。
+调研了同生态（Refined Storage 扩展）的「共振存储 RS Integration」源码（GitHub: Elten-huanghuang/rs_integration，
+**Proprietary License，只借鉴思路、不抄代码**），其配方树实现恰好解决了同类问题。
+
+源码位置：`autocraft/_rsref-github/`（clone 参考，不入库）。核心包：
+`com.huanghuang.rsintegration.crafting.tree/`（PlanTreeModel / PlanTreeNode / PlanTreeLayout / PlanTreeRenderer）
+`com.huanghuang.rsintegration.crafting.plan/`（CraftingPlanScreen 2953 行 = 完整配方树 UI）。
+
+### 14.2 四个可借鉴思路（对照 autocraft bug）
+
+| # | 思路 | rs_integration 实现 | autocraft 现状 | 借鉴价值 |
+|---|------|--------------------|---------------|---------|
+| 1 | **环检测 = path-local stack（弹栈式）** | `Set<IngredientKey> pathStack`，进入压栈、退出弹栈；同一祖先链重复出现 → 真环 A→B→A，创建 `markCycle()` 节点（不无限递归） | `ancestry` 永久集合（只加不减）→ 误伤"共享中间产物"（贤者之石被多分支需要时误判为环） | **高**：改弹栈即可正确区分"真环 vs DAG 共享" |
+| 2 | **叶子定义双条件** | `isLeaf() = step == null && children.isEmpty()` | 环保护/`pickRecipe` null 时返回"有 recipeId 但 children 空"的半截节点 → 父节点把它当有效 child 连入 → 渲染无物可画 = 虚空引用 | **高**：叶子必须无配方步骤且无子节点 |
+| 3 | **graphNodeId（stable DAG identity）** | `@Nullable Integer graphNodeId`：跨树重建时同 key 节点共享同一 id，共享材料（铁锭被两兄弟用）只实例化一次 | `TreeNode` 无稳定身份，共享节点每分支独立展开 → 数量累加错误 | **中**：修共享数量错需要 |
+| 4 | **布局 = measure 缓存 + Box 坐标表** | `IdentityHashMap<PlanTreeNode,Integer> measureCache`（后序测宽）+ `layout()`（前序摆位）+ `List<Box> boxes`；渲染/命中测试统一遍历 boxes | `layoutPositions` 无缓存、无坐标表；渲染连线与布局解耦 → 可能指向未布局节点 | **中**：渲染只遍历已布局 boxes 可兜底虚空引用 |
+
+### 14.3 关键代码模式（思路级，非逐行照抄）
+
+**环检测（弹栈）**：
+```java
+Set<IngredientKey> pathStack = new LinkedHashSet<>();
+buildChildren(node, producers, pathStack, plan);
+
+// 递归内：
+if (!pathStack.add(inputKey)) {
+    // 同一祖先链再次出现 → 真环
+    PlanTreeNode cycleNode = new PlanTreeNode(key, stack, amount, parent.depth+1, null).markCycle();
+    parent.children.add(cycleNode);   // 终止分支，不无限递归
+    continue;
+}
+... buildChildren(child, ...) ...
+pathStack.remove(inputKey);   // 退出弹栈 —— 兄弟分支不受影响
+```
+
+**叶子双条件**：`isLeaf() = step == null && children.isEmpty()`。
+
+**共享节点身份**：`graphNodeId` 由生产者（recipe step）分配，跨分支复用；树重建时按 id 复用对象。
+
+**布局解耦**：`boxes` 是唯一渲染依据；连线只画"两端都在 boxes 里"的边。
+
+### 14.4 对 autocraft 的修复方向（待实施）
+
+按 §13.1 的 bug，最小改动路径（估计 50 行内）：
+1. `PlanTree.expand()`：`ancestry` 永久集合 → **pathStack 弹栈式**（修正共享产物误判为环）；
+2. 环保护 / `pickRecipe == null` 分支：统一返回**真叶子**（无 recipeId、无 children），
+   父节点 addChild 前 `if (child != null)` 防半截节点；
+3. （可选）`totalLeafDemand` 对共享节点按 `graphNodeId` 合并计数（修贤者之石 ×N）。
+
+> 注意：rs_integration 是 Proprietary License —— 以上均为"思路借鉴后自行重写"，不复制其代码。
