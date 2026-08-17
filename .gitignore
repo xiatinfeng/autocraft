@@ -15,6 +15,7 @@ sophcore-source/
 _emijar/
 _emijar24/
 _rsref/
+_rsref-github/
 
 # 本地脚本/临时文件
 _classparse.py
